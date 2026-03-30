@@ -1,0 +1,22 @@
+# Data files — not versioned
+train.csv
+test.csv
+
+# Output
+prediction.csv
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
