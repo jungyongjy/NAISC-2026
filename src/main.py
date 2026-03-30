@@ -400,6 +400,8 @@ def stage5_model_and_output(
         n_jobs          = 1,      # prevents joblib physical core topology errors
     )
     model.fit(X_train_pd, y_train_pd)
+    import joblib
+    joblib.dump(model, Path(__file__).resolve().parent.parent / "model.joblib")
 
     proba_train = model.predict_proba(X_train_pd)[:, 1]
     proba_test  = model.predict_proba(X_test_pd)[:, 1]
@@ -428,6 +430,7 @@ def stage5_model_and_output(
     })
     prediction_df.write_csv(str(output_path))
     print(f"  Saved {len(prediction_df):,} predictions → {output_path}")
+    print(f"  Saved model      → {Path(__file__).resolve().parent.parent / 'model.joblib'}")
 
     # ── Step 5g: Summary table ────────────────────────────────────────────────
     elapsed = time.time() - t0
