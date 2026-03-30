@@ -183,12 +183,84 @@ def stage2_classify_and_detect(
     test_df: pl.DataFrame,
 ) -> tuple[object, object]:
     """Schema classification + two-phase drift detection."""
+    _t2_start = time.time()
     manifest     = classify_features(train_df, sample_size=50_000, random_state=42)
     detector_obj = DriftDetector(manifest, random_state=42)
     drift_summary = detector_obj.detect_all(train_df, test_df)
+    _t2_elapsed = time.time() - _t2_start
 
     n_drifted = len(drift_summary.drifted)
     print(f"✅ Stage 2 complete: {n_drifted} columns flagged for drift")
+
+    # ── Drift summary table ───────────────────────────────────────────────────
+    _MIT_LABEL = {
+        "robust_scaling":                 "Feature Scaling (Robust)",
+        "quantile_binning":               "Quantile Binning (10 deciles)",
+        "log_transform + robust_scaling": "Log + Feature Scaling",
+        "drop_feature":                   "Drop Feature",
+        "binarise (sparse->binary)":      "Binarisation",
+        "frequency_encoding":             "Frequency Encoding",
+        "none":                           "No Action",
+        "no_action (stable)":             "No Action (Stable)",
+        "no_action (excluded type)":      "No Action (Excluded)",
+    }
+    _SEV_ORDER = {"SEVERE": 0, "MODERATE": 1, "MILD": 2}
+
+    if not drift_summary.drifted:
+        print("No drift detected across all features.")
+    else:
+        def _desc(r):
+            sev = r.drift_severity.value
+            ft  = r.feature_type
+            if ft == "numerical":
+                if sev == "SEVERE":   return "Feature ranges explode in test set"
+                if sev == "MODERATE": return "Feature demonstrates greater left-skewness in test set"
+                return "Feature distribution shifts mildly in test set"
+            if ft in ("categorical", "high_cardinality"):
+                if sev == "SEVERE":   return "Feature has new set of categories in test set"
+                return "Feature category proportions shift in test set"
+            return f"{sev} drift detected"
+
+        def _mit(r):
+            mv = r.mitigation.value if hasattr(r.mitigation, "value") else str(r.mitigation)
+            ft = r.feature_type
+            if mv == "frequency_encoding" and ft in ("categorical", "sparse"):
+                return "Target Encoding (Laplace, m=20)"
+            return _MIT_LABEL.get(mv, mv.replace("_", " ").title())
+
+        rows = sorted(
+            drift_summary.drifted,
+            key=lambda x: (_SEV_ORDER.get(x.drift_severity.value, 9),
+                           -(x.test_statistic or 0)),
+        )
+        col1 = [r.column       for r in rows]
+        col2 = [r.feature_type for r in rows]
+        col3 = [_desc(r)       for r in rows]
+        col4 = [_mit(r)        for r in rows]
+
+        h1, h2, h3, h4 = "Columns with Drift", "Column Type", "Drift Description", "Drift Mitigation"
+        w1 = max(len(h1), max(len(v) for v in col1))
+        w2 = max(len(h2), max(len(v) for v in col2))
+        w3 = max(len(h3), max(len(v) for v in col3))
+        w4 = max(len(h4), max(len(v) for v in col4))
+
+        sep = f"+{'-'*(w1+2)}+{'-'*(w2+2)}+{'-'*(w3+2)}+{'-'*(w4+2)}+"
+        hdr = f"| {h1:<{w1}} | {h2:<{w2}} | {h3:<{w3}} | {h4:<{w4}} |"
+        print(sep)
+        print(hdr)
+        print(sep)
+        for c1, c2, c3, c4 in zip(col1, col2, col3, col4):
+            print(f"| {c1:<{w1}} | {c2:<{w2}} | {c3:<{w3}} | {c4:<{w4}} |")
+            print(sep)
+
+    # ── Time taken block ──────────────────────────────────────────────────────
+    print(f"\nb. Detection + Mitigation Time Taken")
+    print(f"+-----------------+")
+    print(f"| Time Taken (s)  |")
+    print(f"+-----------------+")
+    print(f"| {_t2_elapsed:<15.1f} |")
+    print(f"+-----------------+")
+
     return manifest, drift_summary
 
 
@@ -408,7 +480,10 @@ def main() -> None:
         if _pos_label_found:
             break
     if _pos_label_found is None:
-        _pos_label_found = sorted(_unique_labels)[-1]
+        raise ValueError(
+            f"Could not identify positive churn label from: {_unique_labels}. "
+            f"Add the correct label string to _pos_priority and rerun."
+        )
     _label_map = {lbl: (1 if lbl == _pos_label_found else 0) for lbl in _unique_labels}
     print(f"Target label mapping: {_label_map}  (positive={_pos_label_found})")
 
