@@ -36,6 +36,7 @@ import io
 import argparse
 import sys
 import time
+import subprocess
 from pathlib import Path
 
 # Reconfigure stdout/stderr to UTF-8 so emoji in print statements
@@ -136,6 +137,17 @@ def _parse_args() -> argparse.Namespace:
         metavar="PATH",
         help="Path to test/serve CSV file",
     )
+    parser.add_argument(
+        "--skip_dashboard",
+        action="store_true",
+        help="Skip auto-launching Streamlit dashboard after pipeline completes",
+    )
+    parser.add_argument(
+        "--mild_mod_num_policy",
+        choices=["robust", "binning", "delta", "none"],
+        default="binning",
+        help="Policy for MILD/MODERATE numerical drift columns",
+    )
 
     args = parser.parse_args()
 
@@ -157,21 +169,222 @@ def _parse_args() -> argparse.Namespace:
     return args
 
 
+def _launch_dashboard() -> None:
+    """Launch Streamlit dashboard.py in a separate process/console."""
+    dashboard_path = Path(__file__).resolve().parent / "dashboard.py"
+    if not dashboard_path.exists():
+        print(f"⚠ Dashboard file not found at: {dashboard_path}")
+        return
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "streamlit",
+        "run",
+        str(dashboard_path),
+        "--server.headless",
+        "true",
+    ]
+    print(f"\n🚀 Launching dashboard in a new process: {' '.join(cmd)}")
+    print("Pipeline run is complete. Dashboard logs will appear in a separate window/process.")
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.Popen(cmd, creationflags=subprocess.CREATE_NEW_CONSOLE)
+        else:
+            subprocess.Popen(cmd)
+    except FileNotFoundError:
+        print("⚠ Could not start Streamlit. Please install requirements and retry.")
+
+
+def _get_mild_mod_numerical_features(ranked_df: pl.DataFrame) -> list[str]:
+    """Return MILD/MODERATE numerical drifted feature names from ranked_df."""
+    required = {"feature", "col_type", "drift_severity"}
+    if not required.issubset(set(ranked_df.columns)):
+        return []
+
+    out: list[str] = []
+    for row in ranked_df.select(["feature", "col_type", "drift_severity"]).iter_rows(named=True):
+        col_type = str(row["col_type"]).lower()
+        severity = str(row["drift_severity"]).upper()
+        if col_type in {"numerical", "continuous"} and severity in {"MILD", "MODERATE"}:
+            out.append(str(row["feature"]))
+    return out
+
+
+def _quantile_bin_from_train(
+    feature: str,
+    raw_train: pl.DataFrame,
+    raw_test: pl.DataFrame,
+    n_bins: int = 10,
+) -> tuple[pl.Series, pl.Series] | None:
+    """Train-anchored quantile binning for one numeric feature."""
+    train_series = raw_train[feature].cast(pl.Float64)
+    test_series = raw_test[feature].cast(pl.Float64)
+    levels = [i / n_bins for i in range(1, n_bins)]
+    q_exprs = [pl.col(feature).quantile(q, interpolation="linear").alias(f"q{i}") for i, q in enumerate(levels)]
+    raw_breaks = raw_train.select(q_exprs).row(0, named=True)
+    breaks = sorted(set(float(v) for v in raw_breaks.values() if v is not None))
+    if len(breaks) < 2:
+        return None
+
+    labels = [str(i) for i in range(len(breaks) + 1)]
+    tr = (
+        train_series.cut(breaks=breaks, labels=labels)
+        .cast(pl.String)
+        .fill_null("0")
+        .cast(pl.Int8)
+        .alias(feature)
+    )
+    te = (
+        test_series.cut(breaks=breaks, labels=labels)
+        .cast(pl.String)
+        .fill_null("0")
+        .cast(pl.Int8)
+        .alias(feature)
+    )
+    return tr, te
+
+
+def _apply_mild_mod_numerical_policy(
+    policy: str,
+    ranked_df: pl.DataFrame,
+    raw_train: pl.DataFrame,
+    raw_test: pl.DataFrame,
+    mitigated_train: pl.DataFrame,
+    mitigated_test: pl.DataFrame,
+) -> tuple[pl.DataFrame, pl.DataFrame, list[str]]:
+    """Override MILD/MODERATE numerical columns according to selected policy."""
+    features = [
+        f for f in _get_mild_mod_numerical_features(ranked_df)
+        if f in raw_train.columns and f in raw_test.columns
+    ]
+
+    if policy == "robust" or not features:
+        return mitigated_train, mitigated_test, features
+
+    train_cols = {c: mitigated_train[c] for c in mitigated_train.columns}
+    test_cols = {c: mitigated_test[c] for c in mitigated_test.columns}
+
+    for feature in features:
+        if policy == "none":
+            train_cols[feature] = raw_train[feature]
+            test_cols[feature] = raw_test[feature]
+        elif policy == "delta":
+            med = raw_train[feature].cast(pl.Float64).median()
+            if med is None:
+                continue
+            train_cols[feature] = (raw_train[feature].cast(pl.Float64) - float(med)).alias(feature)
+            test_cols[feature] = (raw_test[feature].cast(pl.Float64) - float(med)).alias(feature)
+        elif policy == "binning":
+            result = _quantile_bin_from_train(feature, raw_train, raw_test, n_bins=10)
+            if result is None:
+                continue
+            tr, te = result
+            train_cols[feature] = tr
+            test_cols[feature] = te
+
+    adjusted_train = pl.DataFrame({c: train_cols[c] for c in mitigated_train.columns})
+    adjusted_test = pl.DataFrame({c: test_cols[c] for c in mitigated_test.columns})
+    return adjusted_train, adjusted_test, features
+
+
+def _print_policy_summary(policy: str, features: list[str]) -> None:
+    """Print bordered table for selected mild/moderate numerical policy."""
+    print("\nMild/Moderate Numerical Drift Policy")
+    h1, h2 = "Field", "Value"
+    feat_display = ", ".join(features[:8])
+    if len(features) > 8:
+        feat_display += f" ... (+{len(features) - 8} more)"
+    if not feat_display:
+        feat_display = "(none)"
+    rows = [
+        ("Policy", policy),
+        ("Affected columns", str(len(features))),
+        ("Columns", feat_display),
+    ]
+    w1 = max(len(h1), max(len(r[0]) for r in rows))
+    w2 = max(len(h2), max(len(r[1]) for r in rows))
+    sep = f"+{'-'*(w1+2)}+{'-'*(w2+2)}+"
+    print(sep)
+    print(f"| {h1:<{w1}} | {h2:<{w2}} |")
+    print(sep)
+    for c1, c2 in rows:
+        print(f"| {c1:<{w1}} | {c2:<{w2}} |")
+        print(sep)
+
+
 # ── Pipeline stages ───────────────────────────────────────────────────────────
 
 def stage1_ingest(
     train_path: str,
     test_path: str,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """Load CSVs with Polars. infer_schema_length=None scans full file — safe
-    for hidden datasets where early rows may not represent all dtypes."""
-    train_df = pl.read_csv(train_path, infer_schema_length=None)
-    test_df  = pl.read_csv(test_path,  infer_schema_length=None)
+    """
+    Load CSVs with Polars.
+
+    Candidate 4 — Resilient CSV reading:
+      Three-level fallback handles encoding mismatches, BOM, and string
+      "NaN" variants that would otherwise be misclassified as non-null.
+      infer_schema_length=None scans the full file — safe for hidden datasets
+      where early rows may not represent all dtypes.
+
+    Candidate 5 — Column alignment guard:
+      If test is missing columns that train has (excluding structural columns),
+      fill with null rather than crash downstream. LightGBM handles null
+      natively; a missing column is strictly safer than a KeyError.
+    """
+    _NULL_VALUES = ["", "NA", "N/A", "NULL", "null", "None", "none", "NaN", "nan"]
+    _excluded = {_ID_COL, _TARGET, "Month"}
+
+    def _read_csv(path: str) -> pl.DataFrame:
+        # Level 1: normal read
+        try:
+            return pl.read_csv(
+                path,
+                infer_schema_length=None,
+                null_values=_NULL_VALUES,
+            )
+        except Exception:
+            pass
+        # Level 2: force UTF-8 schema inference
+        try:
+            return pl.read_csv(
+                path,
+                infer_schema_length=None,
+                null_values=_NULL_VALUES,
+                encoding="utf8-lossy",
+            )
+        except Exception:
+            pass
+        # Level 3: ignore errors — last resort
+        return pl.read_csv(
+            path,
+            infer_schema_length=None,
+            null_values=_NULL_VALUES,
+            ignore_errors=True,
+        )
+
+    train_df = _read_csv(train_path)
+    test_df  = _read_csv(test_path)
 
     # Stop condition: CustomerID must be present
     if _ID_COL not in test_df.columns:
         print(f"STOP: '{_ID_COL}' missing from test file — cannot build output.")
         sys.exit(1)
+
+    # Candidate 5 — Column alignment guard:
+    # Fill columns present in train but absent in test with null.
+    _missing_in_test = [
+        c for c in train_df.columns
+        if c not in _excluded and c not in test_df.columns
+    ]
+    if _missing_in_test:
+        print(f"  ⚠ Column alignment: {len(_missing_in_test)} train column(s) "
+              f"absent in test — filled with null: {_missing_in_test}")
+        test_df = test_df.with_columns([
+            pl.lit(None).cast(train_df[c].dtype).alias(c)
+            for c in _missing_in_test
+        ])
 
     print(f"✅ Stage 1 complete: {len(train_df):,} train rows, "
           f"{len(test_df):,} test rows loaded")
@@ -188,6 +401,16 @@ def stage2_classify_and_detect(
     detector_obj = DriftDetector(manifest, random_state=42)
     drift_summary = detector_obj.detect_all(train_df, test_df)
     _t2_elapsed = time.time() - _t2_start
+
+    # ── Phase C summary ───────────────────────────────────────────────────────
+    all_results = list(drift_summary.results.values())
+    n_temporal_flagged = sum(1 for r in all_results if r.phase_c_drift_is_temporal)
+    n_upgraded_by_c    = sum(
+        1 for r in all_results
+        if r.phase_c_notes and "upgraded" in r.phase_c_notes and r.drift_detected
+    )
+    print(f"  Phase C: {n_temporal_flagged} feature(s) with temporal drift concentration | "
+          f"{n_upgraded_by_c} feature(s) upgraded to MILD by sub-population test")
 
     n_drifted = len(drift_summary.drifted)
     print(f"✅ Stage 2 complete: {n_drifted} columns flagged for drift")
@@ -214,7 +437,7 @@ def stage2_classify_and_detect(
             ft  = r.feature_type
             if ft == "numerical":
                 if sev == "SEVERE":   return "Feature ranges explode in test set"
-                if sev == "MODERATE": return "Feature demonstrates greater left-skewness in test set"
+                if sev == "MODERATE": return "Feature demonstrates moderate distribution shift in test set"
                 return "Feature distribution shifts mildly in test set"
             if ft in ("categorical", "high_cardinality"):
                 if sev == "SEVERE":   return "Feature has new set of categories in test set"
@@ -223,9 +446,8 @@ def stage2_classify_and_detect(
 
         def _mit(r):
             mv = r.mitigation.value if hasattr(r.mitigation, "value") else str(r.mitigation)
-            ft = r.feature_type
-            if mv == "frequency_encoding" and ft in ("categorical", "sparse"):
-                return "Target Encoding (Laplace, m=20)"
+            if mv == "frequency_encoding":
+                return "Target Encoding (Laplace, m=10)"
             return _MIT_LABEL.get(mv, mv.replace("_", " ").title())
 
         rows = sorted(
@@ -290,6 +512,7 @@ def stage3_rank(
             "raw_score":      pl.Float64,
             "weighted_score": pl.Float64,
             "drift_rank":     pl.UInt32,
+            "drift_severity": pl.String,   # matches non-empty path from rank_drift()
         })
         print("✅ Stage 3 complete: no drifted features to rank")
         return ranked_df
@@ -328,7 +551,7 @@ def stage5_model_and_output(
     t0: float,
     _label_map: dict | None = None,
     _NON_FEAT: set | None = None,
-) -> None:
+) -> tuple[float, float | None]:
     """
     Step 5a: String normalisation in Polars (must happen before pandas handoff).
     Step 5b: Feature / target split.
@@ -397,11 +620,21 @@ def stage5_model_and_output(
         is_unbalance    = True,
         random_state    = 42,
         importance_type = "gain",
-        n_jobs          = 1,      # prevents joblib physical core topology errors
     )
     model.fit(X_train_pd, y_train_pd)
     import joblib
     joblib.dump(model, Path(__file__).resolve().parent.parent / "model.joblib")
+
+    # Export gain importance for dashboard
+    import pandas as _pd
+    _fi_df = _pd.DataFrame({
+        "feature": model.booster_.feature_name(),
+        "importance": model.booster_.feature_importance(importance_type="gain"),
+    }).sort_values("importance", ascending=False).reset_index(drop=True)
+    _fi_df.index += 1
+    _fi_df.index.name = "rank"
+    _fi_df.to_csv(Path(__file__).resolve().parent.parent / "feature_importance.csv")
+    print(f"  Saved feature_importance.csv → {Path(__file__).resolve().parent.parent / 'feature_importance.csv'}")
 
     proba_train = model.predict_proba(X_train_pd)[:, 1]
     proba_test  = model.predict_proba(X_test_pd)[:, 1]
@@ -413,12 +646,71 @@ def stage5_model_and_output(
         y_test_pd = test_df.select(_TARGET).to_pandas()[_TARGET].astype(str).map(_label_map)
         au_prc_test = average_precision_score(y_test_pd, proba_test)
         au_prc_display = au_prc_test
-        print(f"  TRAIN AU-PRC : {au_prc_train:.4f}")
-        print(f"  TEST  AU-PRC : {au_prc_test:.4f}")
     else:
+        au_prc_test = None
         au_prc_display = au_prc_train
-        print(f"  TRAIN AU-PRC : {au_prc_train:.4f}")
-        print("TEST AU-PRC: unavailable (no ground truth)")
+
+    # AU-PRC table (bordered)
+    print("\nAU-PRC Results")
+    _h1, _h2 = "Split", "AU-PRC"
+    _rows = [("Train", f"{au_prc_train:.4f}")]
+    if au_prc_test is not None:
+        _rows.append(("Test", f"{au_prc_test:.4f}"))
+    else:
+        _rows.append(("Test", "N/A (no ground truth)"))
+    _w1 = max(len(_h1), max(len(r[0]) for r in _rows))
+    _w2 = max(len(_h2), max(len(r[1]) for r in _rows))
+    _sep = f"+{'-'*(_w1+2)}+{'-'*(_w2+2)}+"
+    print(_sep)
+    print(f"| {_h1:<{_w1}} | {_h2:<{_w2}} |")
+    print(_sep)
+    for _c1, _c2 in _rows:
+        print(f"| {_c1:<{_w1}} | {_c2:<{_w2}} |")
+        print(_sep)
+
+    # ── Confusion matrix (interpretability only) ──────────────────────────────
+    if _TARGET in test_df.columns:
+        from sklearn.metrics import confusion_matrix as _cm_fn
+        _preds = (proba_test >= 0.5).astype(int)
+        _cm    = _cm_fn(y_test_pd, _preds)
+        _tn, _fp, _fn, _tp = _cm.ravel()
+        _prec = _tp / (_tp + _fp) if (_tp + _fp) > 0 else 0.0
+        _rec  = _tp / (_tp + _fn) if (_tp + _fn) > 0 else 0.0
+        _f1   = (2 * _prec * _rec / (_prec + _rec)
+                 if (_prec + _rec) > 0 else 0.0)
+        print("\nConfusion Matrix (threshold = 0.50)")
+        _ch = ["Actual \\ Predicted", "Predicted No", "Predicted Yes"]
+        _cm_rows = [
+            ("Actual No", f"{_tn:,}", f"{_fp:,}"),
+            ("Actual Yes", f"{_fn:,}", f"{_tp:,}"),
+        ]
+        _w1 = max(len(_ch[0]), max(len(r[0]) for r in _cm_rows))
+        _w2 = max(len(_ch[1]), max(len(r[1]) for r in _cm_rows))
+        _w3 = max(len(_ch[2]), max(len(r[2]) for r in _cm_rows))
+        _sep = f"+{'-'*(_w1+2)}+{'-'*(_w2+2)}+{'-'*(_w3+2)}+"
+        print(_sep)
+        print(f"| {_ch[0]:<{_w1}} | {_ch[1]:<{_w2}} | {_ch[2]:<{_w3}} |")
+        print(_sep)
+        for _r1, _r2, _r3 in _cm_rows:
+            print(f"| {_r1:<{_w1}} | {_r2:<{_w2}} | {_r3:<{_w3}} |")
+            print(_sep)
+
+        print("\nConfusion Matrix Metrics")
+        _mh1, _mh2 = "Metric", "Value"
+        _mrows = [
+            ("Precision", f"{_prec:.4f}"),
+            ("Recall", f"{_rec:.4f}"),
+            ("F1", f"{_f1:.4f}"),
+        ]
+        _mw1 = max(len(_mh1), max(len(r[0]) for r in _mrows))
+        _mw2 = max(len(_mh2), max(len(r[1]) for r in _mrows))
+        _msep = f"+{'-'*(_mw1+2)}+{'-'*(_mw2+2)}+"
+        print(_msep)
+        print(f"| {_mh1:<{_mw1}} | {_mh2:<{_mw2}} |")
+        print(_msep)
+        for _m1, _m2 in _mrows:
+            print(f"| {_m1:<{_mw1}} | {_m2:<{_mw2}} |")
+            print(_msep)
 
     # ── Step 5f: Write prediction.csv to project root ─────────────────────────
     # Project root = parent of src/
@@ -445,6 +737,90 @@ def stage5_model_and_output(
     print(f"{'Total Runtime':<20} {f'{elapsed:.1f}s':>18}")
     print("==========================================")
 
+    return au_prc_train, au_prc_test
+
+
+# ── Dashboard feed export ─────────────────────────────────────────────────────
+
+def export_dashboard_feeds(
+    drift_summary: object,
+    ranked_df: pl.DataFrame,
+    manifest: object,
+    n_train: int,
+    n_test: int,
+    au_prc_train: float,
+    au_prc_test: float | None,
+    runtime_seconds: float,
+) -> None:
+    """
+    Export CSV/JSON files consumed by dashboard_ver4.py.
+    All files are written to the project root (parent of src/),
+    alongside prediction.csv and model.joblib.
+
+    Files written:
+        drift_results.csv    — one row per drifted feature (Stage 2 output)
+        ranked_features.csv  — Stage 3 ranked output with weighted scores
+        pipeline_meta.json   — AU-PRC scores, row counts, feature count, runtime
+    """
+    import pandas as pd
+    import json
+
+    root = Path(__file__).resolve().parent.parent
+
+    # ── 1. drift_results.csv ─────────────────────────────────────────────────
+    _MIT_LABEL = {
+        "robust_scaling":                 "robust_scaling",
+        "quantile_binning":               "quantile_binning",
+        "log_transform + robust_scaling": "log_transform + robust_scaling",
+        "frequency_encoding":             "frequency_encoding",
+        "drop_feature":                   "drop_feature",
+        "none":                           "none",
+        "no_action (stable)":             "no_action (stable)",
+        "no_action (excluded type)":      "no_action (excluded type)",
+    }
+    drift_rows = []
+    for r in drift_summary.drifted:
+        mit_val = r.mitigation.value if hasattr(r.mitigation, "value") else str(r.mitigation)
+        drift_rows.append({
+            "feature":        r.column,
+            "feature_type":   r.feature_type,
+            "drift_severity": r.drift_severity.value,
+            "test_used":      r.test_method.value,
+            "test_statistic": float(r.test_statistic) if r.test_statistic is not None else None,
+            "mitigation":     _MIT_LABEL.get(mit_val, mit_val),
+        })
+    pd.DataFrame(drift_rows).to_csv(root / "drift_results.csv", index=False)
+    print(f"  Saved drift_results.csv     → {root / 'drift_results.csv'}")
+
+    # ── 2. ranked_features.csv ───────────────────────────────────────────────
+    ranked_df.to_pandas().to_csv(root / "ranked_features.csv", index=False)
+    print(f"  Saved ranked_features.csv   → {root / 'ranked_features.csv'}")
+
+    # ── 3. pipeline_meta.json ────────────────────────────────────────────────
+    _excluded_feat_types = {"metadata", "time", "target"}
+    # _excluded_feat_types = {"metadata", "constant", "time", "target"}
+    n_features = len([
+        col for col, profile in manifest.profiles.items()
+        if (profile.feature_type.value
+            if hasattr(profile.feature_type, "value")
+            else str(profile.feature_type)).lower()
+        not in _excluded_feat_types
+    ])
+    meta = {
+        "n_train":         n_train,
+        "n_test":          n_test,
+        "n_features":      n_features,
+        "au_prc_train":    round(au_prc_train, 6),
+        "runtime_seconds": round(runtime_seconds, 2),
+    }
+    if au_prc_test is not None:
+        meta["au_prc_test"] = round(au_prc_test, 6)
+
+    with open(root / "pipeline_meta.json", "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"  Saved pipeline_meta.json    → {root / 'pipeline_meta.json'}")
+
+    print(f"✅ Dashboard feeds exported → {root}")
 
 # ── Main entrypoint ───────────────────────────────────────────────────────────
 
@@ -496,8 +872,18 @@ def main() -> None:
     # ── Stage 4 ───────────────────────────────────────────────────────────────
     mitigated_train, mitigated_test = stage4_mitigate(train_df, test_df, ranked_df, positive_label=_pos_label_found)
 
+    mitigated_train, mitigated_test, policy_features = _apply_mild_mod_numerical_policy(
+        policy=args.mild_mod_num_policy,
+        ranked_df=ranked_df,
+        raw_train=train_df,
+        raw_test=test_df,
+        mitigated_train=mitigated_train,
+        mitigated_test=mitigated_test,
+    )
+    _print_policy_summary(args.mild_mod_num_policy, policy_features)
+
     # ── Stage 5 ───────────────────────────────────────────────────────────────
-    stage5_model_and_output(
+    au_prc_train, au_prc_test = stage5_model_and_output(
         mitigated_train, mitigated_test,
         test_df,
         n_train, n_test,
@@ -506,6 +892,21 @@ def main() -> None:
         _NON_FEAT=_NON_FEAT,
     )
 
+    # ── Dashboard feed export ─────────────────────────────────────────────────
+    runtime = time.time() - t0
+    export_dashboard_feeds(
+        drift_summary   = drift_summary,
+        ranked_df       = ranked_df,
+        manifest        = manifest,
+        n_train         = n_train,
+        n_test          = n_test,
+        au_prc_train    = au_prc_train,
+        au_prc_test     = au_prc_test,
+        runtime_seconds = runtime,
+    )
+
+    if not args.skip_dashboard:
+        _launch_dashboard()
 
 if __name__ == "__main__":
     main()

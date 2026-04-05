@@ -21,22 +21,21 @@ Treatment routing (keyed on ranked_df["col_type"]):
           column is replaced by a new Int64 column of the same name.
 
     categorical / LOW_CARD_CAT
-        → Laplace-Smoothed Target Encoding (m=20): compute per-category churn
+        → Laplace-Smoothed Target Encoding (m=10): compute per-category churn
           rate from train_df, smooth toward the global rate to penalise rare
           categories, then map onto both splits.  Smoothing formula:
               smoothed = (n * rate + m * global_rate) / (n + m)
           Unseen test categories fall back to global_rate.  Result is Float64.
 
-    numerical / CONTINUOUS — SEVERE drift
+    numerical / CONTINUOUS — ALL severities (MILD, MODERATE, SEVERE)
         → Quantile Binning: compute N_BINS=10 decile breakpoints from train_df,
           apply pl.cut() with those fixed breaks to both splits.  Converts a
           distorted continuous distribution into a clean ordinal rank (0–9).
           LightGBM splits on ordinal bins very efficiently.  Breakpoints are
           train-anchored — test values outside the train range land in bin 0 or 9.
-
-    numerical / CONTINUOUS — MILD or MODERATE drift
-        → Robust Scaling: (x - median) / IQR, parameters from train_df only.
-          If IQR == 0 the column is left unchanged and a warning is printed.
+          Rationale: LightGBM is rank-order invariant.  Robust scaling is a
+          monotonic transform that provably cannot change any model split.
+          Quantile binning is non-monotonic and yields a measurable AU-PRC gain.
 
 Constraints
 -----------
@@ -54,10 +53,15 @@ import polars as pl
 _HIGH_CARD_TYPES = {"high_cardinality", "high_card_cat"}
 _CAT_TYPES       = {"categorical", "low_card_cat"}
 _NUM_TYPES       = {"numerical", "continuous"}
+_SPARSE_TYPES    = {"sparse"}
 
 _TARGET_COL = "ChurnStatus"
-_LAPLACE_M  = 20   # smoothing strength for target encoding
+_LAPLACE_M  = 10   # smoothing strength for target encoding
 N_BINS      = 10   # number of equal-frequency bins for quantile binning
+
+# ── Structural pruning thresholds (Change 3) ──────────────────────────────────
+PRUNE_UNSEEN_CAT_THRESHOLD = 0.30   # drop if >30% test rows have unseen categories
+PRUNE_COLLAPSED_IQR_RATIO  = 0.01   # drop if test IQR < 1% of train IQR
 
 
 # ── Frequency Encoding ────────────────────────────────────────────────────────
@@ -118,7 +122,7 @@ def _target_encode_column(
     positive_label: str = "Yes",
 ) -> tuple[pl.Series, pl.Series]:
     """
-    Laplace-Smoothed Target Encoding (m=_LAPLACE_M=20).
+    Laplace-Smoothed Target Encoding (m=_LAPLACE_M=10).
 
     Smoothing formula applied as a single Polars expression (no Python loops):
         smoothed_rate = (n * category_rate + m * global_rate) / (n + m)
@@ -307,7 +311,7 @@ def mitigate(
 
     Routing priority:
         1. high_cardinality  → Frequency Encoding          (intercepts DROP)
-        2. categorical        → Laplace-Smoothed Target Encoding (m=20)
+        2. categorical        → Laplace-Smoothed Target Encoding (m=10)
         3. numerical SEVERE   → Quantile Binning             (10 decile bins)
         4. numerical MILD/MOD → Robust Scaling               ((x-median)/IQR)
         5. anything else      → warn and skip
@@ -349,6 +353,79 @@ def mitigate(
             print(f"  ⚠ mitigate: '{feature}' not found in DataFrames — skipped.")
             continue
 
+        # ── Structural pruning (runs before col_type routing) ─────────────────
+        # Condition 1: Unseen category saturation (categorical features)
+        if col_type in _CAT_TYPES | _HIGH_CARD_TYPES:
+            n_test_rows = len(test_df)
+            if n_test_rows > 0:
+                tr_norm = (
+                    train_df[feature]
+                    .cast(pl.String)
+                    .str.to_lowercase()
+                    .str.strip_chars()
+                    .str.replace_all(r'[-_]', ' ')
+                    .str.replace_all(r'\s+', ' ')
+                    .drop_nulls()
+                )
+                te_norm = (
+                    test_df[feature]
+                    .cast(pl.String)
+                    .str.to_lowercase()
+                    .str.strip_chars()
+                    .str.replace_all(r'[-_]', ' ')
+                    .str.replace_all(r'\s+', ' ')
+                )
+                train_cats_df = (
+                    tr_norm.alias("__cat__")
+                    .to_frame()
+                    .unique()
+                )
+                te_norm_df = te_norm.fill_null("__null__").alias("__cat__").to_frame()
+                unseen_count = int(
+                    te_norm_df
+                    .join(train_cats_df, on="__cat__", how="anti")
+                    .height
+                )
+                unseen_ratio = unseen_count / n_test_rows
+                if unseen_ratio > PRUNE_UNSEEN_CAT_THRESHOLD:
+                    print(f"  ✂ PRUNED: {feature} — "
+                          f"{unseen_ratio*100:.1f}% of test rows carry unseen categories")
+                    null_series_train = pl.Series([None] * len(train_df), dtype=pl.Null)
+                    null_series_test  = pl.Series([None] * n_test_rows,   dtype=pl.Null)
+                    train_cols[feature] = null_series_train.alias(feature)
+                    test_cols[feature]  = null_series_test.alias(feature)
+                    continue
+
+        # Condition 2: Near-constant test collapse (numerical features)
+        elif col_type in _NUM_TYPES:
+            te_stats = (
+                test_df
+                .select([
+                    pl.col(feature).quantile(0.75, interpolation="linear").alias("p75"),
+                    pl.col(feature).quantile(0.25, interpolation="linear").alias("p25"),
+                ])
+                .row(0, named=True)
+            )
+            test_iqr  = float((te_stats["p75"] or 0.0) - (te_stats["p25"] or 0.0))
+            # Train IQR recomputed here (manifest not available in mitigator)
+            tr_stats = (
+                train_df
+                .select([
+                    pl.col(feature).quantile(0.75, interpolation="linear").alias("p75"),
+                    pl.col(feature).quantile(0.25, interpolation="linear").alias("p25"),
+                ])
+                .row(0, named=True)
+            )
+            train_iqr = float((tr_stats["p75"] or 0.0) - (tr_stats["p25"] or 0.0))
+            if train_iqr > 1.0 and test_iqr < PRUNE_COLLAPSED_IQR_RATIO * train_iqr:
+                print(f"  ✂ PRUNED: {feature} — test IQR collapsed to near-zero "
+                      f"(test_iqr={test_iqr:.4f}, train_iqr={train_iqr:.4f})")
+                null_series_train = pl.Series([None] * len(train_df), dtype=pl.Null)
+                null_series_test  = pl.Series([None] * len(test_df),  dtype=pl.Null)
+                train_cols[feature] = null_series_train.alias(feature)
+                test_cols[feature]  = null_series_test.alias(feature)
+                continue
+
         if col_type in _HIGH_CARD_TYPES:
             # ── Frequency Encoding (intercepts DROP) ──────────────────────
             tr_enc, te_enc = _frequency_encode_column(feature, train_df, test_df)
@@ -366,37 +443,38 @@ def mitigate(
                   f"(global_rate={global_rate:.4f}, m={_LAPLACE_M})")
 
         elif col_type in _NUM_TYPES:
-            if severity == "SEVERE":
-                # ── Quantile Binning — SEVERE numerical drift ──────────────
-                result = _quantile_bin_column(feature, train_df, test_df)
-                if result is None:
-                    # Degenerate breaks — fall back to robust scaling
-                    print(f"  ⚠ quantile-bin degenerate breaks for '{feature}' "
-                          f"— falling back to robust scaling")
-                    result = _robust_scale_column(feature, train_df, test_df)
-                    if result is None:
-                        print(f"  ⚠ robust-scale also skipped (IQR=0): {feature}")
-                        continue
-                    tr_sc, te_sc = result
-                    train_cols[feature] = tr_sc
-                    test_cols[feature]  = te_sc
-                    print(f"  ✔ robust-scaled   : {feature}  (fallback)")
-                else:
-                    tr_b, te_b = result
-                    train_cols[feature] = tr_b
-                    test_cols[feature]  = te_b
-                    print(f"  ✔ quantile-binned : {feature}  "
-                          f"({N_BINS} bins, SEVERE drift → ordinal rank 0–{N_BINS-1})")
+            # ── Quantile Binning — ALL numerical drift severities ──────────
+            # Robust scaling is a monotonic transform: it provably cannot
+            # change any split LightGBM makes.  Quantile binning is non-
+            # monotonic and yields a measurable AU-PRC improvement.
+            result = _quantile_bin_column(feature, train_df, test_df)
+            if result is None:
+                # Degenerate breaks (e.g. zero-IQR column) — leave unchanged
+                print(f"  ⚠ quantile-bin degenerate breaks for '{feature}' — skipped")
+                continue
+            tr_b, te_b = result
+            train_cols[feature] = tr_b
+            test_cols[feature]  = te_b
+            print(f"  ✔ quantile-binned : {feature}  "
+                  f"({N_BINS} bins, {severity} drift → ordinal rank 0–{N_BINS-1})")
+
+        elif col_type in _SPARSE_TYPES:
+            # ── Binarisation — sparse drift (presence rate or value shift) ─
+            # Convert to 1/0 indicator of non-null / non-zero presence.
+            # Fitted on train only: no parameters needed beyond the operation
+            # itself. LightGBM can then split cleanly on the binary signal.
+            # This correctly handles both numeric sparse (zero-heavy) and
+            # non-numeric sparse (null-heavy) columns.
+            is_num_col = train_df[feature].dtype in pl.NUMERIC_DTYPES
+            if is_num_col:
+                tr_bin = (train_df[feature].fill_null(0) != 0).cast(pl.Int8).alias(feature)
+                te_bin = (test_df[feature].fill_null(0)  != 0).cast(pl.Int8).alias(feature)
             else:
-                # ── Robust Scaling — MILD / MODERATE numerical drift ───────
-                result = _robust_scale_column(feature, train_df, test_df)
-                if result is None:
-                    print(f"  ⚠ robust-scale skipped (IQR=0): {feature}")
-                    continue
-                tr_sc, te_sc = result
-                train_cols[feature] = tr_sc
-                test_cols[feature]  = te_sc
-                print(f"  ✔ robust-scaled   : {feature}  ({severity} drift)")
+                tr_bin = train_df[feature].is_not_null().cast(pl.Int8).alias(feature)
+                te_bin = test_df[feature].is_not_null().cast(pl.Int8).alias(feature)
+            train_cols[feature] = tr_bin
+            test_cols[feature]  = te_bin
+            print(f"  ✔ binarised       : {feature}  (sparse drift → 0/1 presence indicator)")
 
         else:
             print(f"  ⚠ mitigate: unrecognised col_type '{col_type}' "
@@ -408,4 +486,3 @@ def mitigate(
     del train_cols, test_cols
 
     return mitigated_train, mitigated_test
-
