@@ -224,15 +224,45 @@ def load_pipeline_outputs():
     return drift_df, ranked_df, meta
 
 
+_VIZ_SAMPLE = 200_000   # max rows loaded into browser for distribution plots
+
+
 @st.cache_data
 def load_raw_data():
+    """Load train/test for visualisation only — capped at _VIZ_SAMPLE rows each.
+    At 10M rows the full files are ~22 GB; sampling to 200K is safe for all
+    distribution plots and feature exploration pages.
+    """
     base = Path(__file__).parent
     for d in [base, base.parent, Path(".")]:
         tp = d / "train.csv"
         ep = d / "test.csv"
         if tp.exists() and ep.exists():
-            return pd.read_csv(tp), pd.read_csv(ep)
+            tr = pd.read_csv(tp)
+            te = pd.read_csv(ep)
+            if len(tr) > _VIZ_SAMPLE:
+                tr = tr.sample(n=_VIZ_SAMPLE, random_state=42).reset_index(drop=True)
+            if len(te) > _VIZ_SAMPLE:
+                te = te.sample(n=_VIZ_SAMPLE, random_state=42).reset_index(drop=True)
+            return tr, te
     return None, None
+
+
+@st.cache_data
+def load_test_labels():
+    """Load only CustomerID + ChurnStatus from test.csv for confusion matrix.
+    Reading 2 columns is fast even at 10M rows (~80 MB vs 22 GB full load).
+    """
+    base = Path(__file__).parent
+    for d in [base, base.parent, Path(".")]:
+        ep = d / "test.csv"
+        if ep.exists():
+            try:
+                return pd.read_csv(ep, usecols=["CustomerID", "ChurnStatus"])
+            except ValueError:
+                # ChurnStatus absent (hidden test set) — return just IDs
+                return pd.read_csv(ep, usecols=["CustomerID"])
+    return None
 
 
 @st.cache_data
@@ -258,6 +288,7 @@ def load_feature_importance():
 # ── Load Everything ───────────────────────────────────────────────────────────
 drift_df, ranked_df, meta = load_pipeline_outputs()
 train, test = load_raw_data()
+test_labels = load_test_labels()   # full-fidelity labels for confusion matrix
 pred_df = load_predictions()
 fi_df = load_feature_importance()
 
@@ -700,6 +731,13 @@ elif page == "Feature Drift":
     st.markdown("# Feature Drift")
     st.markdown("Interactive exploration of individual feature distributions")
     st.markdown("---")
+
+    if train is not None and len(train) >= _VIZ_SAMPLE:
+        st.info(
+            f"ℹ️ Distribution plots show a random sample of {_VIZ_SAMPLE:,} rows "
+            f"(dataset has {meta.get('n_train', '?'):,} train rows). "
+            "Drift detection ran on the full dataset."
+        )
 
     if train is None or test is None:
         st.error("train.csv and test.csv are required for this page. "
@@ -1446,20 +1484,21 @@ elif page == "Model Performance":
     _cm_ready   = False
     _cm_message = ""
 
-    if pred_df is not None and test is not None and "ChurnStatus" in test.columns:
+    if pred_df is not None and test_labels is not None and "ChurnStatus" in test_labels.columns:
         try:
-            # Merge predictions with true labels on CustomerID
+            # Merge predictions with true labels on CustomerID.
+            # Uses test_labels (CustomerID + ChurnStatus only) — fast even at 10M rows.
             _pred_col = "probability_score"
             _id_col   = "CustomerID"
 
-            if _id_col in pred_df.columns and _id_col in test.columns:
+            if _id_col in pred_df.columns and _id_col in test_labels.columns:
                 _merged = pred_df[[_id_col, _pred_col]].merge(
-                    test[[_id_col, "ChurnStatus"]], on=_id_col, how="inner"
+                    test_labels[[_id_col, "ChurnStatus"]], on=_id_col, how="inner"
                 )
             else:
                 # Fall back to positional join if no CustomerID
                 _merged = pred_df[[_pred_col]].copy()
-                _merged["ChurnStatus"] = test["ChurnStatus"].values[:len(_merged)]
+                _merged["ChurnStatus"] = test_labels["ChurnStatus"].values[:len(_merged)]
 
             # Detect positive label
             _pos_hints  = {"yes", "1", "true", "y", "churn"}
@@ -1473,11 +1512,11 @@ elif page == "Model Performance":
         except Exception as e:
             _cm_message = f"Could not compute confusion matrix: {e}"
     elif pred_df is None:
-        _cm_message = "prediction.csv not found. Run Cell 5 in the notebook, then re-export."
-    elif test is None:
+        _cm_message = "prediction.csv not found. Run the pipeline first."
+    elif test_labels is None:
         _cm_message = "test.csv not found. Place it in the same folder as dashboard.py."
     else:
-        _cm_message = "test.csv has no ChurnStatus column — cannot compute confusion matrix."
+        _cm_message = "test.csv has no ChurnStatus column — confusion matrix not available on the hidden test set."
 
     if not _cm_ready:
         st.info(f"ℹ️ {_cm_message}")
