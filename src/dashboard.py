@@ -230,21 +230,37 @@ _VIZ_SAMPLE = 50_000    # max rows loaded into browser for distribution plots
 @st.cache_data
 def load_raw_data():
     """Load train/test for visualisation only — capped at _VIZ_SAMPLE rows each.
-    At 10M rows the full files are ~22 GB; sampling to 200K is safe for all
-    distribution plots and feature exploration pages.
+
+    Uses Polars (Arrow columnar, ~3-5x less peak RAM than pandas) for the initial
+    read, then samples before handing off to pandas for plotting.  The full file
+    is still read — a true streaming random sample would require a two-pass
+    row-count then skip, which is overkill for a dashboard — but Polars keeps
+    peak memory well below the pandas equivalent.
     """
+    import polars as _pl
+
     base = Path(__file__).parent
     for d in [base, base.parent, Path(".")]:
         tp = d / "train.csv"
         ep = d / "test.csv"
         if tp.exists() and ep.exists():
-            tr = pd.read_csv(tp)
-            te = pd.read_csv(ep)
-            if len(tr) > _VIZ_SAMPLE:
-                tr = tr.sample(n=_VIZ_SAMPLE, random_state=42).reset_index(drop=True)
-            if len(te) > _VIZ_SAMPLE:
-                te = te.sample(n=_VIZ_SAMPLE, random_state=42).reset_index(drop=True)
-            return tr, te
+            try:
+                tr_pl = _pl.read_csv(str(tp), infer_schema_length=50_000)
+                te_pl = _pl.read_csv(str(ep), infer_schema_length=50_000)
+                if len(tr_pl) > _VIZ_SAMPLE:
+                    tr_pl = tr_pl.sample(n=_VIZ_SAMPLE, seed=42)
+                if len(te_pl) > _VIZ_SAMPLE:
+                    te_pl = te_pl.sample(n=_VIZ_SAMPLE, seed=42)
+                return tr_pl.to_pandas(), te_pl.to_pandas()
+            except Exception:
+                # Fallback to pandas if Polars read fails
+                tr = pd.read_csv(tp)
+                te = pd.read_csv(ep)
+                if len(tr) > _VIZ_SAMPLE:
+                    tr = tr.sample(n=_VIZ_SAMPLE, random_state=42).reset_index(drop=True)
+                if len(te) > _VIZ_SAMPLE:
+                    te = te.sample(n=_VIZ_SAMPLE, random_state=42).reset_index(drop=True)
+                return tr, te
     return None, None
 
 

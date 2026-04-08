@@ -268,7 +268,14 @@ def _apply_mild_mod_numerical_policy(
     if policy == "binning":
         return mitigated_train, mitigated_test, features
 
-    if policy == "robust" or not features:
+    if not features:
+        return mitigated_train, mitigated_test, features
+
+    if policy == "robust":
+        # "robust" is intentionally identical to "binning" — mitigate() already
+        # applies quantile binning for all numerical severities (C5).  Kept as a
+        # CLI option for experimental use; no additional transform is applied.
+        print("  ℹ mild_mod_num_policy=robust: mitigate() binning already applied — no override.")
         return mitigated_train, mitigated_test, features
 
     train_cols = {c: mitigated_train[c] for c in mitigated_train.columns}
@@ -741,8 +748,16 @@ def stage5_model_and_output(
         else:
             y_test_eval = y_test_pd
             proba_test_eval = proba_test
-        au_prc_test = average_precision_score(y_test_eval, proba_test_eval)
-        au_prc_display = au_prc_test
+        # Guard: hidden test set has dummy ChurnStatus (single class or unmapped values).
+        # average_precision_score raises ValueError when only one class is present.
+        _n_test_classes = int(y_test_eval.nunique()) if len(y_test_eval) > 0 else 0
+        if _n_test_classes < 2:
+            print("  ℹ Test labels are dummy/single-class — AU-PRC and confusion matrix not available.")
+            au_prc_test = None
+            au_prc_display = au_prc_train
+        else:
+            au_prc_test = average_precision_score(y_test_eval, proba_test_eval)
+            au_prc_display = au_prc_test
     else:
         au_prc_test = None
         au_prc_display = au_prc_train
@@ -766,48 +781,53 @@ def stage5_model_and_output(
         print(_sep)
 
     # ── Confusion matrix (interpretability only) ──────────────────────────────
-    if _TARGET in test_df.columns:
+    # Only shown when real test labels exist (au_prc_test is not None).
+    # Skipped on hidden test set where ChurnStatus is dummy values.
+    if au_prc_test is not None:
         from sklearn.metrics import confusion_matrix as _cm_fn
         _preds = (proba_test_eval >= 0.5).astype(int)
         _cm    = _cm_fn(y_test_eval, _preds)
-        _tn, _fp, _fn, _tp = _cm.ravel()
-        _prec = _tp / (_tp + _fp) if (_tp + _fp) > 0 else 0.0
-        _rec  = _tp / (_tp + _fn) if (_tp + _fn) > 0 else 0.0
-        _f1   = (2 * _prec * _rec / (_prec + _rec)
-                 if (_prec + _rec) > 0 else 0.0)
-        print("\nConfusion Matrix (threshold = 0.50)")
-        _ch = ["Actual \\ Predicted", "Predicted No", "Predicted Yes"]
-        _cm_rows = [
-            ("Actual No", f"{_tn:,}", f"{_fp:,}"),
-            ("Actual Yes", f"{_fn:,}", f"{_tp:,}"),
-        ]
-        _w1 = max(len(_ch[0]), max(len(r[0]) for r in _cm_rows))
-        _w2 = max(len(_ch[1]), max(len(r[1]) for r in _cm_rows))
-        _w3 = max(len(_ch[2]), max(len(r[2]) for r in _cm_rows))
-        _sep = f"+{'-'*(_w1+2)}+{'-'*(_w2+2)}+{'-'*(_w3+2)}+"
-        print(_sep)
-        print(f"| {_ch[0]:<{_w1}} | {_ch[1]:<{_w2}} | {_ch[2]:<{_w3}} |")
-        print(_sep)
-        for _r1, _r2, _r3 in _cm_rows:
-            print(f"| {_r1:<{_w1}} | {_r2:<{_w2}} | {_r3:<{_w3}} |")
+        if _cm.shape != (2, 2):
+            print("  ⚠ Confusion matrix is not 2×2 — skipping.")
+        else:
+            _tn, _fp, _fn, _tp = _cm.ravel()
+            _prec = _tp / (_tp + _fp) if (_tp + _fp) > 0 else 0.0
+            _rec  = _tp / (_tp + _fn) if (_tp + _fn) > 0 else 0.0
+            _f1   = (2 * _prec * _rec / (_prec + _rec)
+                     if (_prec + _rec) > 0 else 0.0)
+            print("\nConfusion Matrix (threshold = 0.50)")
+            _ch = ["Actual \\ Predicted", "Predicted No", "Predicted Yes"]
+            _cm_rows = [
+                ("Actual No", f"{_tn:,}", f"{_fp:,}"),
+                ("Actual Yes", f"{_fn:,}", f"{_tp:,}"),
+            ]
+            _w1 = max(len(_ch[0]), max(len(r[0]) for r in _cm_rows))
+            _w2 = max(len(_ch[1]), max(len(r[1]) for r in _cm_rows))
+            _w3 = max(len(_ch[2]), max(len(r[2]) for r in _cm_rows))
+            _sep = f"+{'-'*(_w1+2)}+{'-'*(_w2+2)}+{'-'*(_w3+2)}+"
             print(_sep)
+            print(f"| {_ch[0]:<{_w1}} | {_ch[1]:<{_w2}} | {_ch[2]:<{_w3}} |")
+            print(_sep)
+            for _r1, _r2, _r3 in _cm_rows:
+                print(f"| {_r1:<{_w1}} | {_r2:<{_w2}} | {_r3:<{_w3}} |")
+                print(_sep)
 
-        print("\nConfusion Matrix Metrics")
-        _mh1, _mh2 = "Metric", "Value"
-        _mrows = [
-            ("Precision", f"{_prec:.4f}"),
-            ("Recall", f"{_rec:.4f}"),
-            ("F1", f"{_f1:.4f}"),
-        ]
-        _mw1 = max(len(_mh1), max(len(r[0]) for r in _mrows))
-        _mw2 = max(len(_mh2), max(len(r[1]) for r in _mrows))
-        _msep = f"+{'-'*(_mw1+2)}+{'-'*(_mw2+2)}+"
-        print(_msep)
-        print(f"| {_mh1:<{_mw1}} | {_mh2:<{_mw2}} |")
-        print(_msep)
-        for _m1, _m2 in _mrows:
-            print(f"| {_m1:<{_mw1}} | {_m2:<{_mw2}} |")
+            print("\nConfusion Matrix Metrics")
+            _mh1, _mh2 = "Metric", "Value"
+            _mrows = [
+                ("Precision", f"{_prec:.4f}"),
+                ("Recall", f"{_rec:.4f}"),
+                ("F1", f"{_f1:.4f}"),
+            ]
+            _mw1 = max(len(_mh1), max(len(r[0]) for r in _mrows))
+            _mw2 = max(len(_mh2), max(len(r[1]) for r in _mrows))
+            _msep = f"+{'-'*(_mw1+2)}+{'-'*(_mw2+2)}+"
             print(_msep)
+            print(f"| {_mh1:<{_mw1}} | {_mh2:<{_mw2}} |")
+            print(_msep)
+            for _m1, _m2 in _mrows:
+                print(f"| {_m1:<{_mw1}} | {_m2:<{_mw2}} |")
+                print(_msep)
 
     # ── Step 5f: Write prediction.csv to project root ─────────────────────────
     # Project root = parent of src/
