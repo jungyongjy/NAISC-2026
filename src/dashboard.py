@@ -224,7 +224,7 @@ def load_pipeline_outputs():
     return drift_df, ranked_df, meta
 
 
-_VIZ_SAMPLE = 200_000   # max rows loaded into browser for distribution plots
+_VIZ_SAMPLE = 50_000    # max rows loaded into browser for distribution plots
 
 
 @st.cache_data
