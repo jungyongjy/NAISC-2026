@@ -1,9 +1,17 @@
 # Data files — not versioned
 train.csv
 test.csv
+*.csv
+!prediction.csv
+
+# Generated pipeline output (re-created on each run)
+pipeline_meta.json
+
+# Local dev / internal tooling — not for submission
+donotupload/
 
 # Output
-prediction.csv
+# prediction.csv is required for submission, so it is explicitly allowed above.
 
 # Python cache
 __pycache__/

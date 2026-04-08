@@ -40,12 +40,13 @@ class DriftSeverity(str, Enum):
 
 
 class TestMethod(str, Enum):
-    KS_2SAMP      = "Kolmogorov-Smirnov"
-    PSI           = "Population Stability Index"
-    JS_DIVERGENCE = "Jensen-Shannon Divergence"
-    Z_PROPORTION  = "Two-Proportion Z-Test"
-    PRESCREENED   = "Pre-Screen Only (fast)"
-    SKIPPED       = "Skipped"
+    KS_2SAMP        = "Kolmogorov-Smirnov"
+    PSI             = "Population Stability Index"
+    JS_DIVERGENCE   = "Jensen-Shannon Divergence"
+    Z_PROPORTION    = "Two-Proportion Z-Test"
+    PRESCREENED     = "Pre-Screen Only (fast)"
+    SKIPPED         = "Skipped"
+    PHASE_C_SUBPOP  = "Phase C Sub-population"
 
 
 @dataclass
@@ -68,6 +69,13 @@ class ColumnDriftResult:
     drift_severity: DriftSeverity      = DriftSeverity.NONE
     mitigation:     MitigationStrategy = MitigationStrategy.NO_ACTION_EXCLUDED
     notes:          str                = ""
+
+    # ── Phase C: sub-population drift ───────────────────────────────────
+    phase_c_drift_detected:    bool = False
+    phase_c_drift_is_temporal: bool = False   # drift concentrated in recent months
+    phase_c_notes:             str  = ""      # human-readable summary of findings
+    phase_c_segment_stable:    bool = False   # True = drift not confirmed at month-segment level
+    phase_c_drifted_months:    str  = ""      # comma-separated test months whose stat is outside train range
 
 
 @dataclass

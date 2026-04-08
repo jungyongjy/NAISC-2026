@@ -126,6 +126,51 @@ def _recency_weights(
     )
 
 
+# C7: Month-level recency aggregation (no per-row join)
+def _recency_weights_month_level(
+    serve_df: pl.DataFrame,
+    month_col: str,
+    lambda_decay: float,
+) -> pl.DataFrame:
+    """
+    Compute per-month decay weights without a per-row join.
+
+    Steps:
+      1. Count rows per month (group_by on one column — fast).
+      2. Join rank_map (≤24 rows) to the per-month counts.
+      3. Compute decay_weight at month level.
+
+    Returns a small DataFrame [month_col, n_rows, month_rank, decay_weight, w_fraction].
+    """
+    month_counts = (
+        serve_df
+        .select(month_col)
+        .group_by(month_col)
+        .agg(pl.len().alias("n_rows"))
+    )
+    rank_map = _build_month_rank_map(serve_df.select(month_col), month_col)
+
+    per_month = (
+        month_counts
+        .join(rank_map, on=month_col, how="left")
+        .with_columns(
+            (pl.col("month_rank").cast(pl.Float64) * lambda_decay)
+            .exp()
+            .alias("decay_weight")
+        )
+        .with_columns(
+            (
+                pl.col("decay_weight") * pl.col("n_rows")
+            ).alias("weighted_count")
+        )
+    )
+    total_weighted = float(per_month["weighted_count"].sum() or 1.0)
+    per_month = per_month.with_columns(
+        (pl.col("weighted_count") / total_weighted).alias("w_fraction")
+    )
+    return per_month
+
+
 def _weighted_row_fraction(
     weighted_df: pl.DataFrame,
     month_col: str,
@@ -220,22 +265,10 @@ def rank_drift(
     • Only the Month column of serve_df is read; all other columns are ignored,
       so runtime is O(n_rows) for a single group_by, not O(n_rows × n_cols).
     """
-    # ── Step 1: compute recency factor from serve_df ──────────────────────
-    # We only need the Month column — select it first to avoid materialising
-    # all 500 feature columns in the join.
-    serve_months = serve_df.select(month_col)
-
-    weighted_df  = _recency_weights(serve_months, month_col, lambda_decay)
-    per_month    = _weighted_row_fraction(weighted_df, month_col)
-
-    # Scalar recency factor: decay-weighted mean of per-month row fractions.
-    # = Σ_t (w_fraction_t × w_fraction_t) normalised
-    # Simplified to: sum of squared w_fractions (Herfindahl-style concentration).
-    # A high value means serve data is concentrated in recent months.
+    # C7: Use month-level aggregation - no per-row join to 10M rows
+    per_month = _recency_weights_month_level(serve_df, month_col, lambda_decay)
     recency_factor = float(
-        per_month
-        .select((pl.col("w_fraction") ** 2).sum())
-        .item()
+        per_month.select((pl.col("w_fraction") ** 2).sum()).item()
     )
 
     # ── Step 2: map severity labels to numeric weights ────────────────────

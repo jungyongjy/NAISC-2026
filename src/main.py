@@ -32,6 +32,7 @@ Namespace note:
 
 from __future__ import annotations
 
+import gc
 import io
 import argparse
 import sys
@@ -202,13 +203,16 @@ def _get_mild_mod_numerical_features(ranked_df: pl.DataFrame) -> list[str]:
     if not required.issubset(set(ranked_df.columns)):
         return []
 
-    out: list[str] = []
-    for row in ranked_df.select(["feature", "col_type", "drift_severity"]).iter_rows(named=True):
-        col_type = str(row["col_type"]).lower()
-        severity = str(row["drift_severity"]).upper()
-        if col_type in {"numerical", "continuous"} and severity in {"MILD", "MODERATE"}:
-            out.append(str(row["feature"]))
-    return out
+    # C8: Vectorised filter — no Python-level row iteration
+    return (
+        ranked_df
+        .filter(
+            pl.col("col_type").str.to_lowercase().is_in({"numerical", "continuous"})
+            & pl.col("drift_severity").str.to_uppercase().is_in({"MILD", "MODERATE"})
+        )
+        ["feature"]
+        .to_list()
+    )
 
 
 def _quantile_bin_from_train(
@@ -259,6 +263,11 @@ def _apply_mild_mod_numerical_policy(
         if f in raw_train.columns and f in raw_test.columns
     ]
 
+    # C5: "binning" is now the default and is already applied by mitigate() for ALL
+    # numerical severities. Skip entirely to avoid re-computing identical bins.
+    if policy == "binning":
+        return mitigated_train, mitigated_test, features
+
     if policy == "robust" or not features:
         return mitigated_train, mitigated_test, features
 
@@ -283,8 +292,9 @@ def _apply_mild_mod_numerical_policy(
             train_cols[feature] = tr
             test_cols[feature] = te
 
-    adjusted_train = pl.DataFrame({c: train_cols[c] for c in mitigated_train.columns})
-    adjusted_test = pl.DataFrame({c: test_cols[c] for c in mitigated_test.columns})
+    # C8: only reconstructs modified columns; unchanged columns share buffers
+    adjusted_train = mitigated_train.with_columns([train_cols[f] for f in features])
+    adjusted_test  = mitigated_test.with_columns([test_cols[f]  for f in features])
     return adjusted_train, adjusted_test, features
 
 
@@ -325,47 +335,51 @@ def stage1_ingest(
     Candidate 4 — Resilient CSV reading:
       Three-level fallback handles encoding mismatches, BOM, and string
       "NaN" variants that would otherwise be misclassified as non-null.
-      infer_schema_length=None scans the full file — safe for hidden datasets
-      where early rows may not represent all dtypes.
+      infer_schema_length=100_000 scans the first 100K rows — safe for hidden datasets
+      where early rows may represent all dtypes, while avoiding full-file scan.
 
     Candidate 5 — Column alignment guard:
       If test is missing columns that train has (excluding structural columns),
       fill with null rather than crash downstream. LightGBM handles null
       natively; a missing column is strictly safer than a KeyError.
+
+    C1 — Train schema reuse:
+      Reuse train's inferred dtypes for test file to avoid a second full
+      schema inference pass.
     """
     _NULL_VALUES = ["", "NA", "N/A", "NULL", "null", "None", "none", "NaN", "nan"]
     _excluded = {_ID_COL, _TARGET, "Month"}
 
-    def _read_csv(path: str) -> pl.DataFrame:
+    def _read_csv(path: str, schema_overrides: dict | None = None) -> pl.DataFrame:
+        kwargs = dict(
+            infer_schema_length=100_000,
+            null_values=_NULL_VALUES,
+        )
+        if schema_overrides:
+            kwargs["schema_overrides"] = schema_overrides
+
         # Level 1: normal read
         try:
-            return pl.read_csv(
-                path,
-                infer_schema_length=None,
-                null_values=_NULL_VALUES,
-            )
+            return pl.read_csv(path, **kwargs)
         except Exception:
             pass
         # Level 2: force UTF-8 schema inference
         try:
-            return pl.read_csv(
-                path,
-                infer_schema_length=None,
-                null_values=_NULL_VALUES,
-                encoding="utf8-lossy",
-            )
+            return pl.read_csv(path, **kwargs, encoding="utf8-lossy")
         except Exception:
             pass
         # Level 3: ignore errors — last resort
-        return pl.read_csv(
-            path,
-            infer_schema_length=None,
-            null_values=_NULL_VALUES,
-            ignore_errors=True,
-        )
+        return pl.read_csv(path, **kwargs, ignore_errors=True)
 
+    # Read train first - infer schema once
     train_df = _read_csv(train_path)
-    test_df  = _read_csv(test_path)
+
+    # Reuse train schema for test - avoids a second inference pass
+    _train_schema = {
+        c: dtype for c, dtype in zip(train_df.columns, train_df.dtypes)
+        if c not in _excluded
+    }
+    test_df = _read_csv(test_path, schema_overrides=_train_schema)
 
     # Stop condition: CustomerID must be present
     if _ID_COL not in test_df.columns:
@@ -397,9 +411,16 @@ def stage2_classify_and_detect(
 ) -> tuple[object, object]:
     """Schema classification + two-phase drift detection."""
     _t2_start = time.time()
-    manifest     = classify_features(train_df, sample_size=50_000, random_state=42)
+    _tc = time.time()
+    manifest = classify_features(train_df, sample_size=50_000, random_state=42)
+    print(f"[TIMING] classify_features: {time.time() - _tc:.2f}s")
     detector_obj = DriftDetector(manifest, random_state=42)
+    _td = time.time()
     drift_summary = detector_obj.detect_all(train_df, test_df)
+    print(f"[TIMING] detect_all: {time.time() - _td:.2f}s")
+    _all_results = list(drift_summary.results.values())
+    _n_prescreen = sum(1 for r in _all_results if r.prescreen_flagged)
+    print(f"[TIMING] prescreen_flagged={_n_prescreen} drift_confirmed={len(drift_summary.drifted)}")
     _t2_elapsed = time.time() - _t2_start
 
     # ── Phase C summary ───────────────────────────────────────────────────────
@@ -450,6 +471,14 @@ def stage2_classify_and_detect(
                 return "Target Encoding (Laplace, m=10)"
             return _MIT_LABEL.get(mv, mv.replace("_", " ").title())
 
+        def _segment(r):
+            if getattr(r, "phase_c_segment_stable", False):
+                return "Segment-stable (composition?)"
+            drifted_months = getattr(r, "phase_c_drifted_months", "")
+            if drifted_months:
+                return drifted_months
+            return "—"
+
         rows = sorted(
             drift_summary.drifted,
             key=lambda x: (_SEV_ORDER.get(x.drift_severity.value, 9),
@@ -459,20 +488,22 @@ def stage2_classify_and_detect(
         col2 = [r.feature_type for r in rows]
         col3 = [_desc(r)       for r in rows]
         col4 = [_mit(r)        for r in rows]
+        col5 = [_segment(r)    for r in rows]
 
-        h1, h2, h3, h4 = "Columns with Drift", "Column Type", "Drift Description", "Drift Mitigation"
+        h1, h2, h3, h4, h5 = "Columns with Drift", "Column Type", "Drift Description", "Drift Mitigation", "Segment Drift"
         w1 = max(len(h1), max(len(v) for v in col1))
         w2 = max(len(h2), max(len(v) for v in col2))
         w3 = max(len(h3), max(len(v) for v in col3))
         w4 = max(len(h4), max(len(v) for v in col4))
+        w5 = max(len(h5), max(len(v) for v in col5))
 
-        sep = f"+{'-'*(w1+2)}+{'-'*(w2+2)}+{'-'*(w3+2)}+{'-'*(w4+2)}+"
-        hdr = f"| {h1:<{w1}} | {h2:<{w2}} | {h3:<{w3}} | {h4:<{w4}} |"
+        sep = f"+{'-'*(w1+2)}+{'-'*(w2+2)}+{'-'*(w3+2)}+{'-'*(w4+2)}+{'-'*(w5+2)}+"
+        hdr = f"| {h1:<{w1}} | {h2:<{w2}} | {h3:<{w3}} | {h4:<{w4}} | {h5:<{w5}} |"
         print(sep)
         print(hdr)
         print(sep)
-        for c1, c2, c3, c4 in zip(col1, col2, col3, col4):
-            print(f"| {c1:<{w1}} | {c2:<{w2}} | {c3:<{w3}} | {c4:<{w4}} |")
+        for c1, c2, c3, c4, c5 in zip(col1, col2, col3, col4, col5):
+            print(f"| {c1:<{w1}} | {c2:<{w2}} | {c3:<{w3}} | {c4:<{w4}} | {c5:<{w5}} |")
             print(sep)
 
     # ── Time taken block ──────────────────────────────────────────────────────
@@ -562,6 +593,7 @@ def stage5_model_and_output(
     Step 5g: Print summary table.
     """
     # ── Step 5a: String normalisation — single .with_columns() pass ──────────
+    _tnorm = time.time()
     # Identify all string/categorical columns in both DataFrames at once.
     str_cols_train = [
         c for c in mitigated_train.columns
@@ -588,6 +620,7 @@ def stage5_model_and_output(
               .str.replace_all(r'[-_]', ' ').str.replace_all(r'\s+', ' ')
             for c in str_cols_test
         ])
+    print(f"[TIMING] stage5_string_norm: {time.time() - _tnorm:.2f}s")
 
     # ── Step 5b: Feature / target split ──────────────────────────────────────
     if _NON_FEAT is None:
@@ -600,17 +633,62 @@ def stage5_model_and_output(
         c for c in feature_cols if c in mitigated_test.columns
     ])
 
-    # ── Step 5c: Pandas handoff (ONLY here) ──────────────────────────────────
-    X_train_pd = X_train.to_pandas()
-    y_train_pd = y_train.to_pandas()[_TARGET].astype(str).map(_label_map)
-    X_test_pd  = X_test.to_pandas()
+    # Drop rows with null target values
+    non_null_mask = ~y_train.to_series().is_null()
+    X_train = X_train.filter(non_null_mask)
+    y_train = y_train.filter(non_null_mask)
+    print(f"  ⚠ Dropped {(~non_null_mask).sum()} rows with null target from training")
 
-    # Align any remaining object columns to CategoricalDtype
-    # (after string normalisation, most should already be consistent)
-    for col in X_train_pd.select_dtypes(include="object").columns:
-        X_train_pd[col] = X_train_pd[col].astype("category")
-        if col in X_test_pd.columns:
-            # Copy the exact CategoricalDtype from train — including category labels
+    # Drop columns that were entirely nulled (pruned by structural pruning)
+    null_train_cols = [c for c in X_train.columns if X_train[c].null_count() == len(X_train)]
+    null_test_cols = [c for c in X_test.columns if X_test[c].null_count() == len(X_test)]
+    all_null_cols = set(null_train_cols) | set(null_test_cols)
+    if all_null_cols:
+        print(f"  ⚠ Dropping {len(all_null_cols)} fully-null columns from model input: {list(all_null_cols)[:5]}...")
+        X_train = X_train.select([c for c in X_train.columns if c not in all_null_cols])
+        X_test  = X_test.select([c for c in X_test.columns if c not in all_null_cols])
+
+    # Free mitigated frames immediately — X_train/y_train/X_test hold the only
+    # data we still need. Keeping them alive during LightGBM training wastes 6-8 GB.
+    del mitigated_train, mitigated_test
+    gc.collect()
+
+    # C6: Cast string columns to Categorical before pandas handoff
+    # Polars Categorical → Arrow DictionaryArray → pandas CategoricalDtype.
+    # Zero Python-level string iteration; eliminates the post-conversion loop.
+    _str_dtypes = (pl.Utf8, pl.String)
+
+    def _cast_strings_to_categorical(df: pl.DataFrame) -> pl.DataFrame:
+        str_cols = [c for c in df.columns if df[c].dtype in _str_dtypes]
+        if not str_cols:
+            return df
+        return df.with_columns([pl.col(c).cast(pl.Categorical) for c in str_cols])
+
+    X_train = _cast_strings_to_categorical(X_train)
+    X_test  = _cast_strings_to_categorical(X_test)
+
+    # ── Step 5c: Pandas handoff (ONLY here) ──────────────────────────────────
+    # to_pandas() now uses zero-copy Arrow dictionary arrays for Categorical columns.
+    # use_pyarrow_extension_array=False keeps standard pandas CategoricalDtype
+    # (required for LightGBM compatibility).
+    _tpd = time.time()
+    X_train_pd = X_train.to_pandas()
+    del X_train   # free Polars copy — pandas owns the data from here
+    gc.collect()
+    y_train_pd = y_train.to_pandas()[_TARGET].astype(str).map(_label_map)
+    del y_train
+    X_test_pd  = X_test.to_pandas()
+    del X_test
+    gc.collect()
+    print(f"[TIMING] stage5_pandas_handoff: {time.time() - _tpd:.2f}s")
+
+    # Align test Categorical categories to match train (required by LightGBM).
+    # This loop now operates on CategoricalDtype (not object), which is O(n_unique)
+    # not O(n_rows) — fast regardless of dataset size.
+    for col in X_train_pd.select_dtypes(include="category").columns:
+        if col in X_test_pd.columns and str(X_test_pd[col].dtype) == "category":
+            X_test_pd[col] = X_test_pd[col].astype(X_train_pd[col].dtype)
+        elif col in X_test_pd.columns:
             X_test_pd[col] = X_test_pd[col].astype(X_train_pd[col].dtype)
 
     # ── Step 5d: LightGBM — EXACTLY these hyperparameters, no others ─────────
@@ -621,7 +699,9 @@ def stage5_model_and_output(
         random_state    = 42,
         importance_type = "gain",
     )
+    _tfit = time.time()
     model.fit(X_train_pd, y_train_pd)
+    print(f"[TIMING] stage5_lgbm_fit: {time.time() - _tfit:.2f}s")
     import joblib
     joblib.dump(model, Path(__file__).resolve().parent.parent / "model.joblib")
 
@@ -636,15 +716,32 @@ def stage5_model_and_output(
     _fi_df.to_csv(Path(__file__).resolve().parent.parent / "feature_importance.csv")
     print(f"  Saved feature_importance.csv → {Path(__file__).resolve().parent.parent / 'feature_importance.csv'}")
 
+    _tpred = time.time()
     proba_train = model.predict_proba(X_train_pd)[:, 1]
+    del X_train_pd   # no longer needed — proba_train holds the result
+    gc.collect()
     proba_test  = model.predict_proba(X_test_pd)[:, 1]
+    del X_test_pd
+    gc.collect()
+    print(f"[TIMING] stage5_predict: {time.time() - _tpred:.2f}s")
 
     # ── Step 5e: AU-PRC ───────────────────────────────────────────────────────
     au_prc_train = average_precision_score(y_train_pd, proba_train)
+    del y_train_pd
+    gc.collect()
 
     if _TARGET in test_df.columns:
         y_test_pd = test_df.select(_TARGET).to_pandas()[_TARGET].astype(str).map(_label_map)
-        au_prc_test = average_precision_score(y_test_pd, proba_test)
+        # Drop null targets from test evaluation too
+        nan_mask = y_test_pd.isna()
+        if nan_mask.any():
+            print(f"  ⚠ Dropped {nan_mask.sum()} rows with null target from test evaluation")
+            y_test_eval = y_test_pd[~nan_mask]
+            proba_test_eval = proba_test[~nan_mask]
+        else:
+            y_test_eval = y_test_pd
+            proba_test_eval = proba_test
+        au_prc_test = average_precision_score(y_test_eval, proba_test_eval)
         au_prc_display = au_prc_test
     else:
         au_prc_test = None
@@ -671,8 +768,8 @@ def stage5_model_and_output(
     # ── Confusion matrix (interpretability only) ──────────────────────────────
     if _TARGET in test_df.columns:
         from sklearn.metrics import confusion_matrix as _cm_fn
-        _preds = (proba_test >= 0.5).astype(int)
-        _cm    = _cm_fn(y_test_pd, _preds)
+        _preds = (proba_test_eval >= 0.5).astype(int)
+        _cm    = _cm_fn(y_test_eval, _preds)
         _tn, _fp, _fn, _tp = _cm.ravel()
         _prec = _tp / (_tp + _fp) if (_tp + _fp) > 0 else 0.0
         _rec  = _tp / (_tp + _fn) if (_tp + _fn) > 0 else 0.0
@@ -788,6 +885,8 @@ def export_dashboard_feeds(
             "test_used":      r.test_method.value,
             "test_statistic": float(r.test_statistic) if r.test_statistic is not None else None,
             "mitigation":     _MIT_LABEL.get(mit_val, mit_val),
+            "phase_c_segment_stable":  r.phase_c_segment_stable,
+            "phase_c_drifted_months":  r.phase_c_drifted_months,
         })
     pd.DataFrame(drift_rows).to_csv(root / "drift_results.csv", index=False)
     print(f"  Saved drift_results.csv     → {root / 'drift_results.csv'}")
@@ -831,14 +930,18 @@ def main() -> None:
     t0 = time.time()
 
     # ── Stage 1 ───────────────────────────────────────────────────────────────
+    _ts1 = time.time()
     train_df, test_df = stage1_ingest(
         args.train_data_filepath,
         args.test_data_filepath,
     )
+    print(f"[TIMING] stage1_ingest: {time.time() - _ts1:.2f}s")
     n_train, n_test = len(train_df), len(test_df)
 
     # ── Stage 2 ───────────────────────────────────────────────────────────────
+    _ts2 = time.time()
     manifest, drift_summary = stage2_classify_and_detect(train_df, test_df)
+    print(f"[TIMING] stage2_total: {time.time() - _ts2:.2f}s")
 
     # ── Build dynamic _NON_FEAT from manifest ────────────────────────────────
     _excluded_types = {FeatureType.METADATA, FeatureType.CONSTANT, FeatureType.TIME, FeatureType.TARGET}
@@ -847,7 +950,7 @@ def main() -> None:
 
     # ── Detect positive label dynamically ──────────────────────────────────
     _target_series_raw = train_df.select(_TARGET).to_series().cast(pl.String)
-    _unique_labels = sorted(_target_series_raw.unique().to_list())
+    _unique_labels = sorted(_target_series_raw.drop_nulls().unique().to_list())
     assert len(_unique_labels) == 2, f"Target must be binary, found: {_unique_labels}"
     _pos_priority = ["yes", "1", "true", "y", "churn"]
     _pos_label_found = None
@@ -867,11 +970,16 @@ def main() -> None:
     print(f"Target label mapping: {_label_map}  (positive={_pos_label_found})")
 
     # ── Stage 3 ───────────────────────────────────────────────────────────────
+    _ts3 = time.time()
     ranked_df = stage3_rank(drift_summary, test_df, manifest=manifest)
+    print(f"[TIMING] stage3_rank: {time.time() - _ts3:.2f}s")
 
     # ── Stage 4 ───────────────────────────────────────────────────────────────
+    _ts4 = time.time()
     mitigated_train, mitigated_test = stage4_mitigate(train_df, test_df, ranked_df, positive_label=_pos_label_found)
+    print(f"[TIMING] stage4_mitigate: {time.time() - _ts4:.2f}s")
 
+    _ts4p = time.time()
     mitigated_train, mitigated_test, policy_features = _apply_mild_mod_numerical_policy(
         policy=args.mild_mod_num_policy,
         ranked_df=ranked_df,
@@ -880,9 +988,16 @@ def main() -> None:
         mitigated_train=mitigated_train,
         mitigated_test=mitigated_test,
     )
+    print(f"[TIMING] stage4_policy: {time.time() - _ts4p:.2f}s")
     _print_policy_summary(args.mild_mod_num_policy, policy_features)
 
+    # Free raw train immediately — mitigated copies are all that's needed from here.
+    # test_df is kept (Stage 5 needs _ID_COL and optional _TARGET for AU-PRC).
+    del train_df
+    gc.collect()
+
     # ── Stage 5 ───────────────────────────────────────────────────────────────
+    _ts5 = time.time()
     au_prc_train, au_prc_test = stage5_model_and_output(
         mitigated_train, mitigated_test,
         test_df,
@@ -891,6 +1006,7 @@ def main() -> None:
         _label_map=_label_map,
         _NON_FEAT=_NON_FEAT,
     )
+    print(f"[TIMING] stage5_total: {time.time() - _ts5:.2f}s")
 
     # ── Dashboard feed export ─────────────────────────────────────────────────
     runtime = time.time() - t0

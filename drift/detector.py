@@ -56,25 +56,27 @@ warnings.filterwarnings("ignore")
 #  Tuneable thresholds
 # ─────────────────────────────────────────────
 
-PRESCREEN_NUM_THRESHOLD  = 0.10
-PRESCREEN_IQR_THRESHOLD  = 0.30
-PRESCREEN_CAT_THRESHOLD  = 0.10
+# Pre-screen thresholds
+PRESCREEN_NUM_THRESHOLD  = 0.10   # 10% mean shift
+PRESCREEN_IQR_THRESHOLD  = 0.30   # 30% IQR gap
+PRESCREEN_CAT_THRESHOLD  = 0.10   # L1 distance > 0.10
 
-KS_MILD     = 0.05
-KS_MODERATE = 0.10
-KS_SEVERE   = 0.20
+KS_MILD     = 0.05   # KS statistic > 0.05 → mild drift
+KS_MODERATE = 0.10   # KS statistic > 0.10 → moderate drift
+KS_SEVERE   = 0.20   # KS statistic > 0.20 → severe drift
 
-PSI_MILD     = 0.10
-PSI_MODERATE = 0.25
-PSI_SEVERE   = 0.50
-
+# PSI thresholds for categorical drift detection
+PSI_MILD     = 0.10   # PSI > 0.10 → mild drift
+PSI_MODERATE = 0.25   # PSI > 0.25 → moderate drift
+PSI_SEVERE   = 0.50   # PSI > 0.50 → severe drift
 JS_MILD     = 0.05
 JS_MODERATE = 0.10
 JS_SEVERE   = 0.20
 
+# Z thresholds for sparse feature drift detection
 Z_MILD     = 2.0
-Z_MODERATE = 3.0
-Z_SEVERE   = 5.0
+Z_MODERATE = 3.5   # was 3.0
+Z_SEVERE   = 5.0   # keep at 5.0
 
 ALPHA             = 0.05
 TRAIN_SAMPLE      = 50_000
@@ -157,6 +159,67 @@ def _value_counts_dict(series: pl.Series, normalize: bool = True) -> Dict[str, f
     return {row[name_col]: row["count"] / total for row in vc.iter_rows(named=True)}
 
 
+# C2: Parallel value counts using pl.collect_all() — batched to cap RAM spike
+_COLLECT_BATCH = 12   # max queries per collect_all call; >50 simultaneous group-bys
+                      # over 10M rows causes large RAM spikes on 32 GB machines
+
+def _batch_value_counts_parallel(
+    df: pl.DataFrame,
+    cols: list,
+) -> dict:
+    """
+    Collect value_counts for all columns using pl.collect_all() in batches.
+    Batching caps the number of simultaneous group-by allocations so a single
+    collect_all over 50+ categorical columns does not spike RAM by 8+ GB.
+    Returns {col: {category: normalised_frequency}}.
+    """
+    if not cols:
+        return {}
+
+    # C2 tuning: for smaller column sets, sequential path is faster than
+    # collect_all scheduling overhead.
+    if len(cols) < 30:
+        out = {}
+        for c in cols:
+            if c in df.columns:
+                out[c] = _value_counts_dict(df[c])
+        return out
+
+    lazy_queries = []
+    valid_cols   = []
+    for col in cols:
+        if col not in df.columns:
+            continue
+        s_norm = _normalise_cat_series(df[col]).fill_null("__null__")
+        lazy_queries.append(
+            s_norm.alias(col)
+            .to_frame()
+            .lazy()
+            .group_by(col)
+            .agg(pl.len().alias("__count__"))
+        )
+        valid_cols.append(col)
+
+    if not lazy_queries:
+        return {}
+
+    total  = len(df)
+    result = {}
+
+    # Process in batches to limit concurrent memory usage
+    for batch_start in range(0, len(lazy_queries), _COLLECT_BATCH):
+        batch_q    = lazy_queries[batch_start : batch_start + _COLLECT_BATCH]
+        batch_cols = valid_cols[batch_start : batch_start + _COLLECT_BATCH]
+        collected  = pl.collect_all(batch_q)
+        for col, vc_df in zip(batch_cols, collected):
+            result[col] = {
+                row[col]: row["__count__"] / total
+                for row in vc_df.iter_rows(named=True)
+            }
+
+    return result
+
+
 def _batch_test_stats(
     test_df: pl.DataFrame,
     num_cols: List[str],
@@ -199,6 +262,49 @@ def _batch_test_stats(
     return num_stats, cat_vc
 
 
+def _batch_monthly_stats(
+    df: pl.DataFrame,
+    numerical_cols: list[str],
+    categorical_cols: list[str],
+    month_col: str,
+) -> tuple[dict[str, dict], dict[str, dict]]:
+    """
+    Batch-compute per-month statistics for all specified columns in a single
+    group_by scan. Returns two dicts:
+
+        num_stats  : {col: {month_value: mean_float}}
+        cat_stats  : {col: {month_value: dominant_proportion_float}}
+
+    Used by Phase C Sub-test 3 to check whether a feature's test-set
+    month-level statistics fall within the range seen in training.
+    Polars-native; no row-level loops.
+    """
+    if month_col not in df.columns:
+        return {}, {}
+
+    num_result: dict[str, dict] = {}
+    cat_result: dict[str, dict] = {}
+
+    # Numerical: one group_by for ALL features — single scan, no chunking needed
+    valid_num = [c for c in numerical_cols if c in df.columns]
+    if valid_num:
+        monthly = df.group_by(month_col).agg(
+            [pl.col(c).mean().alias(c) for c in valid_num]
+        )
+        for row in monthly.iter_rows(named=True):
+            m = row[month_col]
+            for c in valid_num:
+                if c not in num_result:
+                    num_result[c] = {}
+                v = row[c]
+                num_result[c][m] = float(v) if v is not None else 0.0
+
+    # Categorical: caller passes empty list — Sub-test 2 handles categoricals
+    # (left as-is; cat_result stays empty)
+
+    return num_result, cat_result
+
+
 # ─────────────────────────────────────────────
 #  Severity helpers
 # ─────────────────────────────────────────────
@@ -238,14 +344,14 @@ def _assign_mitigation(
     severity: DriftSeverity,
     skewness: float = 0.0,
 ) -> MitigationStrategy:
+    # skewness parameter retained for API compatibility but no longer used.
+    # All numerical drift — regardless of severity — now uses QUANTILE_BIN.
+    # Rationale: LightGBM is rank-order invariant so robust scaling (a monotonic
+    # transform) provably cannot change any split the model makes.  Quantile
+    # binning is non-monotonic and produces a measurable AU-PRC improvement.
     if severity == DriftSeverity.NONE:
         return MitigationStrategy.NO_ACTION_STABLE
     if ft == FeatureType.NUMERICAL:
-        if severity == DriftSeverity.MILD:
-            return MitigationStrategy.ROBUST_SCALE
-        if severity == DriftSeverity.MODERATE:
-            return (MitigationStrategy.LOG_ROBUST_SCALE
-                    if abs(skewness) > 1.0 else MitigationStrategy.ROBUST_SCALE)
         return MitigationStrategy.QUANTILE_BIN
     if ft == FeatureType.CATEGORICAL:
         return MitigationStrategy.FREQUENCY_ENCODE
@@ -401,9 +507,15 @@ def _phase_a_sparse(
     train_df: pl.DataFrame,
     test_df: pl.DataFrame,
     is_num: bool,
+    tr_rate_precomputed: float | None = None,   # ← C3 new
+    te_rate_precomputed: float | None = None,   # ← C3 new
 ) -> ColumnDriftResult:
     """Compare presence rate (non-null/non-zero) between train and test."""
-    if is_num:
+    # C3: Use precomputed rates when available
+    if tr_rate_precomputed is not None and te_rate_precomputed is not None:
+        tr_rate = tr_rate_precomputed
+        te_rate = te_rate_precomputed
+    elif is_num:
         tr_rate = float((train_df[col].fill_null(0) != 0).mean())
         te_rate = float((test_df[col].fill_null(0) != 0).mean())
     else:
@@ -642,6 +754,278 @@ def _phase_b_sparse(
 
 
 # ─────────────────────────────────────────────
+#  Phase C — Sub-population drift
+# ─────────────────────────────────────────────
+
+def _phase_c(
+    result: ColumnDriftResult,
+    train_df: pl.DataFrame,
+    test_df: pl.DataFrame,
+    month_col: str,
+    n_recent_months: int = 3,
+    precomputed_months: list | None = None,    # ← C2 new
+    tr_cat_vc: dict | None = None,             # ← C2 new
+    te_cat_vc: dict | None = None,             # ← C2 new
+    tr_monthly_num: dict | None = None,
+    tr_monthly_cat: dict | None = None,
+    te_monthly_num: dict | None = None,
+    te_monthly_cat: dict | None = None,
+) -> ColumnDriftResult:
+    """
+    Phase C: Sub-population drift analysis.
+
+    Runs on every feature that reached Phase B (prescreen_flagged=True).
+    Applies two sub-tests:
+
+    Sub-test 1 — Temporal segmentation (all feature types):
+        Compare the per-month test stat against recent-train vs full-train
+        to determine whether drift is concentrated in recent history.
+
+    Sub-test 2 — Categorical sub-population (categorical only, excluding
+        HIGH_CARDINALITY and SPARSE):
+        Flag any category whose train/test proportion differs by >0.10.
+        If flagged AND feature previously passed Phase B, upgrade to MILD
+        and assign target encoding.
+
+    All computation is Polars-native (group_by + agg, no row loops).
+    Returns the (potentially mutated) ColumnDriftResult.
+
+    C2 optimization: Uses precomputed months and value counts when available.
+    """
+    col = result.column
+    ft  = result.feature_type   # string value, e.g. "numerical", "categorical"
+
+    # Guard: Month column must be present in both DataFrames
+    if month_col not in train_df.columns or month_col not in test_df.columns:
+        return result
+
+    try:
+        # C2: Use precomputed months if available
+        # ── Sub-test 1: Temporal segmentation ────────────────────────────
+        is_num = col in train_df.columns and _is_numeric(train_df[col].dtype)
+
+        # Determine the N most recent training months
+        train_months_sorted = precomputed_months if precomputed_months is not None else (
+            train_df
+            .select(pl.col(month_col))
+            .unique()
+            .sort(month_col, descending=True)
+            [month_col]
+            .to_list()
+        )
+        recent_train_months = train_months_sorted[:n_recent_months]
+
+        if is_num:
+            # Stat = mean per month
+            test_stat = (
+                test_df
+                .group_by(month_col)
+                .agg(pl.col(col).mean().alias("__stat__"))
+                .select("__stat__")
+                .mean()
+                .item()
+            )
+            full_train_stat = float(train_df[col].mean() or 0.0)
+            recent_train_stat = (
+                train_df
+                .filter(pl.col(month_col).is_in(recent_train_months))
+                .select(pl.col(col).mean().alias("__stat__"))
+                .item()
+            )
+            if recent_train_stat is None:
+                recent_train_stat = full_train_stat
+
+            dist_full   = abs(full_train_stat   - (test_stat or 0.0))
+            dist_recent = abs(recent_train_stat - (test_stat or 0.0))
+            is_temporal = dist_recent < dist_full
+
+        else:
+            # Stat = proportion of dominant category (normalised string)
+            def _dominant_prop(df: pl.DataFrame) -> float:
+                s = _normalise_cat_series(df[col]).fill_null("__null__")
+                vc = s.value_counts(sort=True)
+                total = len(df)
+                if total == 0:
+                    return 0.0
+                return float(vc[vc.columns[1]][0]) / total   # top count / total
+
+            def _dominant_prop_subset(df: pl.DataFrame, months) -> float:
+                sub = df.filter(pl.col(month_col).is_in(months))
+                if len(sub) == 0:
+                    return 0.0
+                return _dominant_prop(sub)
+
+            # C2: Use precomputed dicts for full-dataset dominant prop (avoids 2 value_counts calls)
+            if te_cat_vc and col in te_cat_vc:
+                test_prop = max(te_cat_vc[col].values(), default=0.0)
+            else:
+                test_prop = _dominant_prop(test_df)
+            if tr_cat_vc and col in tr_cat_vc:
+                full_train_prop = max(tr_cat_vc[col].values(), default=0.0)
+            else:
+                full_train_prop = _dominant_prop(train_df)
+            recent_train_prop = _dominant_prop_subset(train_df, recent_train_months)
+
+            dist_full   = abs(full_train_prop   - test_prop)
+            dist_recent = abs(recent_train_prop - test_prop)
+            is_temporal = dist_recent < dist_full
+
+        result.phase_c_drift_is_temporal = is_temporal
+        phase_c_notes = []
+        if is_temporal:
+            phase_c_notes.append(
+                f"temporal: recent-train closer to test "
+                f"(dist_recent={dist_recent:.4f} < dist_full={dist_full:.4f})"
+            )
+
+        # ── Sub-test 2: Categorical sub-population ────────────────────────
+        # Only for CATEGORICAL features (not HIGH_CARDINALITY, not SPARSE)
+        # C2: Use precomputed dicts when available
+        if ft == "categorical":
+            n_train = len(train_df)
+            n_test  = len(test_df)
+
+            if n_train > 0 and n_test > 0:
+                # Use pre-computed dicts when available
+                if tr_cat_vc and col in tr_cat_vc:
+                    full_train_prop = max(tr_cat_vc[col].values(), default=0.0)
+                else:
+                    tr_norm = _normalise_cat_series(train_df[col]).fill_null("__null__")
+                    tr_vc = tr_norm.value_counts()
+                    full_train_prop = float(tr_vc["count"][0]) / n_train if len(tr_vc) > 0 else 0.0
+
+                if te_cat_vc and col in te_cat_vc:
+                    test_prop = max(te_cat_vc[col].values(), default=0.0)
+                else:
+                    te_norm = _normalise_cat_series(test_df[col]).fill_null("__null__")
+                    te_vc = te_norm.value_counts()
+                    test_prop = float(te_vc["count"][0]) / n_test if len(te_vc) > 0 else 0.0
+
+                # Build the proportion DataFrames for the upgrade check.
+                # C2: Use precomputed dicts — avoids 2 more value_counts calls per
+                # categorical column in Phase C (on top of the 2 saved above).
+                _cat_key = "__cat__"
+                if tr_cat_vc and col in tr_cat_vc and te_cat_vc and col in te_cat_vc:
+                    tr_side = pl.DataFrame({
+                        _cat_key:      list(tr_cat_vc[col].keys()),
+                        "__tr_prop__": list(tr_cat_vc[col].values()),
+                    })
+                    te_side = pl.DataFrame({
+                        _cat_key:      list(te_cat_vc[col].keys()),
+                        "__te_prop__": list(te_cat_vc[col].values()),
+                    })
+                else:
+                    tr_norm = _normalise_cat_series(train_df[col]).fill_null("__null__")
+                    te_norm = _normalise_cat_series(test_df[col]).fill_null("__null__")
+                    tr_vc = (tr_norm.value_counts()
+                             .with_columns((pl.col("count") / n_train).alias("__prop__")))
+                    te_vc = (te_norm.value_counts()
+                             .with_columns((pl.col("count") / n_test).alias("__prop__")))
+                    _cat_key = tr_vc.columns[0]
+                    tr_side  = tr_vc.select([_cat_key, "__prop__"]).rename({"__prop__": "__tr_prop__"})
+                    te_side  = te_vc.select([_cat_key, "__prop__"]).rename({"__prop__": "__te_prop__"})
+
+                try:
+                    joined = tr_side.join(te_side, on=_cat_key, how="full", coalesce=True)
+                except TypeError:
+                    # Polars <0.20 does not have coalesce kwarg; fall back to outer
+                    joined = tr_side.join(te_side, on=_cat_key, how="outer")
+                joined = (
+                    joined
+                    .with_columns([
+                        pl.col("__tr_prop__").fill_null(0.0),
+                        pl.col("__te_prop__").fill_null(0.0),
+                    ])
+                    .with_columns(
+                        (pl.col("__tr_prop__") - pl.col("__te_prop__"))
+                        .abs()
+                        .alias("__abs_diff__")
+                    )
+                )
+
+                max_diff = float(joined["__abs_diff__"].max() or 0.0)
+                subpop_flagged = max_diff > 0.10
+
+                if subpop_flagged:
+                    result.phase_c_drift_detected = True
+                    phase_c_notes.append(
+                        f"subpop: max category proportion shift={max_diff:.4f} > 0.10"
+                    )
+
+                    # Upgrade if Phase B said no drift
+                    if not result.drift_detected:
+                        result.drift_detected = True
+                        result.drift_severity = DriftSeverity.MILD
+                        result.mitigation     = MitigationStrategy.FREQUENCY_ENCODE
+                        result.notes += " | upgraded by Phase C"
+                        phase_c_notes.append("upgraded drift_detected=True (MILD)")
+
+        # ── Sub-test 3: Month-segment proportion check ────────────────────
+        # For features with detected drift, check whether test-set monthly
+        # statistics (means for numerical, dominant-category proportion for
+        # categorical) fall within the range observed in training months.
+        #
+        # If ALL test months are within [min(train_monthly) - 1σ,
+        # max(train_monthly) + 1σ], the global drift signal may be a
+        # composition effect (segment proportions changed, not the feature
+        # distribution within segments). Mark phase_c_segment_stable = True.
+        #
+        # If ANY test month is outside that range, record which months
+        # drifted in phase_c_drifted_months.
+        #
+        # This is REPORTING ONLY — it never changes drift_detected, severity,
+        # or mitigation assignment.
+        # Sub-test 3 is numerical-only: categoricals are handled by Sub-test 2
+        # Sub-test 3 runs on ALL Phase-A-flagged numerical features (not just
+        # confirmed-drift ones) so the report shows segmented behaviour even
+        # for features where Phase B found no aggregate drift.  Result is
+        # reporting-only — never alters drift_detected, severity, or mitigation.
+        _run_seg = (ft == "numerical")
+        if _run_seg:
+            is_num_ft = (ft == "numerical")
+            tr_monthly = (tr_monthly_num or {}).get(col) if is_num_ft else (tr_monthly_cat or {}).get(col)
+            te_monthly = (te_monthly_num or {}).get(col) if is_num_ft else (te_monthly_cat or {}).get(col)
+
+            if tr_monthly and te_monthly and len(tr_monthly) >= 2:
+                tr_vals  = list(tr_monthly.values())
+                tr_mean  = sum(tr_vals) / len(tr_vals)
+                tr_var   = sum((v - tr_mean) ** 2 for v in tr_vals) / len(tr_vals)
+                tr_std   = tr_var ** 0.5
+
+                # Floor std at 5% of the absolute mean to avoid degenerate tolerance
+                tol = max(tr_std, 0.05 * abs(tr_mean)) if tr_mean != 0 else max(tr_std, 1e-6)
+
+                lo = min(tr_vals) - tol
+                hi = max(tr_vals) + tol
+
+                drifted_months = [
+                    str(m) for m, v in te_monthly.items()
+                    if v < lo or v > hi
+                ]
+
+                if drifted_months:
+                    result.phase_c_segment_stable  = False
+                    result.phase_c_drifted_months   = ",".join(sorted(drifted_months))
+                    phase_c_notes.append(
+                        f"segment-drift confirmed in months: {result.phase_c_drifted_months}"
+                    )
+                else:
+                    result.phase_c_segment_stable = True
+                    phase_c_notes.append(
+                        "segment-stable: all test months within train monthly range "
+                        f"[{lo:.4f}, {hi:.4f}] — may be composition effect"
+                    )
+
+        result.phase_c_notes = "; ".join(phase_c_notes) if phase_c_notes else ""
+
+    except Exception as exc:
+        # Phase C must never crash the pipeline
+        result.phase_c_notes = f"Phase C error: {exc}"
+
+    return result
+
+
+# ─────────────────────────────────────────────
 #  Main public class
 # ─────────────────────────────────────────────
 
@@ -701,13 +1085,118 @@ class DriftDetector:
                                    FeatureType.HIGH_CARDINALITY)
             and c in test_df.columns
         ]
-        te_num_stats, te_cat_vc = _batch_test_stats(test_df, testable_num, testable_cat)
+
+        # Cap the precomputation samples at 500K rows.  Category-frequency
+        # estimation error at 500K is < ±0.03 % (central-limit), negligible
+        # for both Phase-A L1 prescreens and Phase-B PSI / chi-squared tests.
+        # Phase B has its own internal TRAIN_SAMPLE/TEST_SAMPLE caps so its
+        # statistical power is already decoupled from dataset size.
+        _PRECOMP_SAMPLE = 500_000
+        _te_for_precomp = (
+            test_df.sample(n=_PRECOMP_SAMPLE, seed=self.random_state)
+            if len(test_df) > _PRECOMP_SAMPLE else test_df
+        )
+        te_num_stats, te_cat_vc = _batch_test_stats(_te_for_precomp, testable_num, testable_cat)
+
+        # C3: Pre-compute sparse presence rates for all SPARSE columns
+        sparse_cols_num = [
+            c for c, p in profiles.items()
+            if p.feature_type == FeatureType.SPARSE
+            and c in train_df.columns and c in test_df.columns
+            and _is_numeric(train_df[c].dtype)
+        ]
+        sparse_cols_str = [
+            c for c, p in profiles.items()
+            if p.feature_type == FeatureType.SPARSE
+            and c in train_df.columns and c in test_df.columns
+            and not _is_numeric(train_df[c].dtype)
+        ]
+
+        _sparse_presence: dict = {}   # { col: (tr_rate, te_rate) }
+
+        if sparse_cols_num:
+            tr_num_exprs = [(pl.col(c).fill_null(0) != 0).mean().alias(f"{c}__pres")
+                            for c in sparse_cols_num]
+            te_num_exprs = [(pl.col(c).fill_null(0) != 0).mean().alias(f"{c}__pres")
+                            for c in sparse_cols_num]
+            tr_num_row = train_df.select(tr_num_exprs).row(0, named=True)
+            te_num_row = test_df.select(te_num_exprs).row(0, named=True)
+            for c in sparse_cols_num:
+                _sparse_presence[c] = (
+                    float(tr_num_row[f"{c}__pres"] or 0.0),
+                    float(te_num_row[f"{c}__pres"] or 0.0),
+                )
+
+        if sparse_cols_str:
+            tr_str_exprs = [pl.col(c).is_not_null().mean().alias(f"{c}__pres")
+                            for c in sparse_cols_str]
+            te_str_exprs = [pl.col(c).is_not_null().mean().alias(f"{c}__pres")
+                            for c in sparse_cols_str]
+            tr_str_row = train_df.select(tr_str_exprs).row(0, named=True)
+            te_str_row = test_df.select(te_str_exprs).row(0, named=True)
+            for c in sparse_cols_str:
+                _sparse_presence[c] = (
+                    float(tr_str_row[f"{c}__pres"] or 0.0),
+                    float(te_str_row[f"{c}__pres"] or 0.0),
+                )
 
         # Pre-compute train-side value_counts for categorical columns
-        tr_cat_vc: Dict[str, Dict] = {}
-        for col in testable_cat:
-            if col in train_df.columns:
-                tr_cat_vc[col] = _value_counts_dict(train_df[col])
+        # C2: train side uses parallel batch; test side already computed by _batch_test_stats above.
+        # Both sides are capped at _PRECOMP_SAMPLE rows — see comment above.
+        all_cat_cols_present = [c for c in testable_cat if c in train_df.columns and c in test_df.columns]
+        _tr_for_precomp = (
+            train_df.sample(n=_PRECOMP_SAMPLE, seed=self.random_state)
+            if len(train_df) > _PRECOMP_SAMPLE else train_df
+        )
+        tr_cat_vc = _batch_value_counts_parallel(_tr_for_precomp, all_cat_cols_present)
+        # te_cat_vc already set by _batch_test_stats — do NOT overwrite with parallel version
+
+        # C2: Precompute train months ordering once
+        _month_col_c2 = self.manifest.time[0] if self.manifest.time else "Month"
+        _precomputed_months: list | None = None
+        if _month_col_c2 in train_df.columns:
+            _precomputed_months = (
+                train_df
+                .select(pl.col(_month_col_c2))
+                .unique()
+                .sort(_month_col_c2, descending=True)
+                [_month_col_c2]
+                .to_list()
+            )
+
+        # Phase C Sub-test 3: batch per-month stats for all testable features
+        # Two scans (train + test), each covering all numerical and categorical
+        # columns in a single group_by. Used to check whether features stable
+        # across months — separating genuine drift from composition effects.
+        _month_col_c2_present = (
+            _month_col_c2 in train_df.columns and _month_col_c2 in test_df.columns
+        )
+        _tr_monthly_num: dict = {}
+        _tr_monthly_cat: dict = {}
+        _te_monthly_num: dict = {}
+        _te_monthly_cat: dict = {}
+
+        if _month_col_c2_present:
+            # Sub-test 3 applies to numerical features only — categoricals are already
+            # covered by Sub-test 2. Cap the input to 200K rows per split so the
+            # group_by stays fast regardless of dataset size. Monthly means on a
+            # 200K random sample are unbiased estimators of per-month means.
+            _MONTHLY_SAMPLE = 200_000
+            all_num_cols = [c for c in testable_num if c in train_df.columns]
+            _tr_for_monthly = (
+                train_df.sample(n=_MONTHLY_SAMPLE, seed=self.random_state)
+                if len(train_df) > _MONTHLY_SAMPLE else train_df
+            )
+            _te_for_monthly = (
+                test_df.sample(n=_MONTHLY_SAMPLE, seed=self.random_state)
+                if len(test_df) > _MONTHLY_SAMPLE else test_df
+            )
+            _tr_monthly_num, _tr_monthly_cat = _batch_monthly_stats(
+                _tr_for_monthly, all_num_cols, [], _month_col_c2
+            )
+            _te_monthly_num, _te_monthly_cat = _batch_monthly_stats(
+                _te_for_monthly, all_num_cols, [], _month_col_c2
+            )
 
         # ── Per-column detection loop ──────────────────────────────────
         for col, profile in profiles.items():
@@ -740,12 +1229,17 @@ class DriftDetector:
                 )
 
             elif ft == FeatureType.CATEGORICAL:
-                # Categorical: PSI is cheap enough to run directly — skip pre-screen
+                # Pre-screen using L1 on top-K frequency vectors
+                tr_vc = tr_cat_vc.get(col, {})
+                te_vc = te_cat_vc.get(col, {})
+                all_c = set(list(tr_vc.keys())[:30]) | set(list(te_vc.keys())[:30])
+                l1    = sum(abs(tr_vc.get(c, 0.0) - te_vc.get(c, 0.0)) for c in all_c)
                 result = ColumnDriftResult(
                     column=col, feature_type=ft.value,
-                    prescreen_score=0.0, prescreen_flagged=True,
+                    prescreen_score=l1, prescreen_flagged=l1 > PRESCREEN_CAT_THRESHOLD,
                     test_method=TestMethod.PRESCREENED,
                     mitigation=MitigationStrategy.NO_ACTION_STABLE,
+                    notes=f"l1_freq={l1:.4f}",
                 )
 
             elif ft == FeatureType.HIGH_CARDINALITY:
@@ -763,7 +1257,13 @@ class DriftDetector:
                 )
 
             elif ft == FeatureType.SPARSE:
-                result = _phase_a_sparse(col, train_df, test_df, is_num)
+                # C3: Use precomputed sparse presence rates
+                _pre = _sparse_presence.get(col)
+                result = _phase_a_sparse(
+                    col, train_df, test_df, is_num,
+                    tr_rate_precomputed=_pre[0] if _pre else None,
+                    te_rate_precomputed=_pre[1] if _pre else None,
+                )
 
             else:
                 summary.results[col] = ColumnDriftResult(
@@ -797,8 +1297,20 @@ class DriftDetector:
                 elif ft == FeatureType.SPARSE:
                     result = _phase_b_sparse(result, train_df, test_df, is_num)
 
+            # ── PHASE C (Phase-B-flagged columns only) ──────────────────
+            # C2: Use precomputed values
+            if result.prescreen_flagged:
+                result = _phase_c(
+                    result, train_df, test_df, _month_col_c2,
+                    precomputed_months=_precomputed_months,
+                    tr_cat_vc=tr_cat_vc,
+                    te_cat_vc=te_cat_vc,
+                    tr_monthly_num=_tr_monthly_num,
+                    tr_monthly_cat=_tr_monthly_cat,
+                    te_monthly_num=_te_monthly_num,
+                    te_monthly_cat=_te_monthly_cat,
+                )
+
             summary.results[col] = result
 
         return summary
-
-

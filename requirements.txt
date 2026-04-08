@@ -1,6 +1,11 @@
 numpy
 polars
+pyarrow
+pandas
 scipy
 scikit-learn
 lightgbm==4.6.0
 joblib
+streamlit
+plotly
+

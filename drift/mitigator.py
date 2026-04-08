@@ -64,8 +64,20 @@ PRUNE_UNSEEN_CAT_THRESHOLD = 0.30   # drop if >30% test rows have unseen categor
 PRUNE_COLLAPSED_IQR_RATIO  = 0.01   # drop if test IQR < 1% of train IQR
 
 
-# ── Frequency Encoding ────────────────────────────────────────────────────────
+# C4: Helper for string normalisation (applied once, reused)
+def _normalise_series(series: pl.Series) -> pl.Series:
+    """Apply the standard 4-step string normalisation. Returns the normalised Series."""
+    return (
+        series
+        .cast(pl.String)
+        .str.to_lowercase()
+        .str.strip_chars()
+        .str.replace_all(r'[-_]', ' ')
+        .str.replace_all(r'\s+', ' ')
+    )
 
+
+# C4: Frequency Encoding — uses replace instead of join
 def _frequency_encode_column(
     col: str,
     train_df: pl.DataFrame,
@@ -81,39 +93,36 @@ def _frequency_encode_column(
     Test categories absent from train receive frequency 0.
 
     Returns (freq_train_series, freq_test_series) as Int64.
+
+    C4 optimization: Uses Series.replace() instead of DataFrame join.
     """
-    freq_map = (
-        train_df
-        .select(pl.col(col).cast(pl.String).str.to_lowercase().str.strip_chars().str.replace_all(r'[-_]', ' ').str.replace_all(r'\s+', ' ').alias("__cat__"))
-        .group_by("__cat__")
-        .agg(pl.len().alias("__freq__"))
+    # Normalise each side once
+    tr_norm = _normalise_series(train_df[col]).fill_null("__null__")
+    te_norm = _normalise_series(test_df[col]).fill_null("__null__")
+
+    # Build frequency map from normalised train series (one value_counts pass)
+    vc = tr_norm.value_counts()   # [category_col, "count"]
+    cat_col = vc.columns[0]
+    freq_keys = vc[cat_col].to_list()
+    freq_vals = vc["count"].to_list()
+
+    # Vectorised replace — no DataFrame join overhead
+    tr_encoded = (
+        tr_norm
+        .replace(old=freq_keys, new=freq_vals, default=0)
+        .cast(pl.Int64)
+        .alias(col)
     )
-
-    train_encoded = (
-        train_df
-        .select(pl.col(col).cast(pl.String).str.to_lowercase().str.strip_chars().str.replace_all(r'[-_]', ' ').str.replace_all(r'\s+', ' ').alias("__cat__"))
-        .join(freq_map, on="__cat__", how="left")
-        .select(
-            pl.col("__freq__").fill_null(0).cast(pl.Int64).alias(col)
-        )
-        [col]
+    te_encoded = (
+        te_norm
+        .replace(old=freq_keys, new=freq_vals, default=0)
+        .cast(pl.Int64)
+        .alias(col)
     )
-
-    test_encoded = (
-        test_df
-        .select(pl.col(col).cast(pl.String).str.to_lowercase().str.strip_chars().str.replace_all(r'[-_]', ' ').str.replace_all(r'\s+', ' ').alias("__cat__"))
-        .join(freq_map, on="__cat__", how="left")
-        .select(
-            pl.col("__freq__").fill_null(0).cast(pl.Int64).alias(col)
-        )
-        [col]
-    )
-
-    return train_encoded, test_encoded
+    return tr_encoded, te_encoded
 
 
-# ── Laplace-Smoothed Target Encoding ─────────────────────────────────────────
-
+# C4: Laplace-Smoothed Target Encoding — uses replace instead of join
 def _target_encode_column(
     col: str,
     train_df: pl.DataFrame,
@@ -134,13 +143,19 @@ def _target_encode_column(
     fall back to global_rate.
 
     Returns (encoded_train_series, encoded_test_series) as Float64.
+
+    C4 optimization: Uses Series.replace() instead of DataFrame join.
     """
-    rate_map = (
-        train_df
-        .select([
-            pl.col(col).cast(pl.String).str.to_lowercase().str.replace_all(r'[-_\s]+', ' ').str.strip_chars().alias("__cat__"),
-            (pl.col(_TARGET_COL) == positive_label).cast(pl.Float64).alias("__target__"),
-        ])
+    # Normalise each side once
+    tr_norm = _normalise_series(train_df[col]).fill_null("__null__")
+    te_norm = _normalise_series(test_df[col]).fill_null("__null__")
+
+    # Build smoothed rate map from normalised train (one group-by pass)
+    rate_map_df = (
+        pl.DataFrame({
+            "__cat__":    tr_norm,
+            "__target__": (train_df[_TARGET_COL] == positive_label).cast(pl.Float64),
+        })
         .group_by("__cat__")
         .agg([
             pl.len().alias("__n__"),
@@ -154,44 +169,32 @@ def _target_encode_column(
             .truediv(pl.col("__n__") + _LAPLACE_M)
             .alias("__smoothed_rate__")
         )
-        .select(["__cat__", "__smoothed_rate__"])
     )
+    rate_keys = rate_map_df["__cat__"].to_list()
+    rate_vals = rate_map_df["__smoothed_rate__"].to_list()
 
-    train_encoded = (
-        train_df
-        .select(pl.col(col).cast(pl.String).str.to_lowercase().str.replace_all(r'[-_\s]+', ' ').str.strip_chars().alias("__cat__"))
-        .join(rate_map, on="__cat__", how="left")
-        .select(
-            pl.col("__smoothed_rate__")
-              .fill_null(global_rate)
-              .cast(pl.Float64)
-              .alias(col)
-        )
-        [col]
+    # Vectorised replace — no join
+    tr_encoded = (
+        tr_norm
+        .replace(old=rate_keys, new=rate_vals, default=global_rate)
+        .cast(pl.Float64)
+        .alias(col)
     )
-
-    test_encoded = (
-        test_df
-        .select(pl.col(col).cast(pl.String).str.to_lowercase().str.replace_all(r'[-_\s]+', ' ').str.strip_chars().alias("__cat__"))
-        .join(rate_map, on="__cat__", how="left")
-        .select(
-            pl.col("__smoothed_rate__")
-              .fill_null(global_rate)
-              .cast(pl.Float64)
-              .alias(col)
-        )
-        [col]
+    te_encoded = (
+        te_norm
+        .replace(old=rate_keys, new=rate_vals, default=global_rate)
+        .cast(pl.Float64)
+        .alias(col)
     )
+    return tr_encoded, te_encoded
 
-    return train_encoded, test_encoded
 
-
-# ── Quantile Binning ──────────────────────────────────────────────────────────
-
+# C4: Quantile Binning — uses cached breaks when available
 def _quantile_bin_column(
     col: str,
     train_df: pl.DataFrame,
     test_df: pl.DataFrame,
+    breaks_cache: dict | None = None,    # ← new
 ) -> tuple[pl.Series, pl.Series] | None:
     """
     Quantile Binning for SEVERE numerical drift (N_BINS=10 equal-frequency bins).
@@ -202,61 +205,36 @@ def _quantile_bin_column(
     shifts — LightGBM only needs to know which decile a value falls in, not the
     exact value.
 
-    Steps (all train-anchored, Polars-native):
-      1. Compute N_BINS-1 decile breakpoints from train_df (10th, 20th … 90th
-         percentile).  Deduplicate breaks in case of ties (e.g. many zeros).
-      2. Apply pl.cut() with those fixed breakpoints to both train and test.
-         pl.cut() assigns each value to a labelled bin; labels are integer
-         strings "0" through "N_BINS-1".
-      3. Cast labels to Int8 for memory efficiency and LightGBM compatibility.
-
-    Train-anchored guarantee: test values below the train minimum land in bin 0;
-    values above the train maximum land in bin N_BINS-1.  This correctly signals
-    to LightGBM that those test values are extreme relative to training norms.
-
-    Returns None if fewer than 2 unique breakpoints exist (e.g. a near-constant
-    column — should not occur for SEVERE drift but handled defensively).
-    Returns (binned_train_series, binned_test_series) as Int8 otherwise.
+    C4 optimization: Uses pre-computed breaks cache when available.
     """
-    quantile_levels = [i / N_BINS for i in range(1, N_BINS)]  # 0.1, 0.2 … 0.9
-
-    # Compute breakpoints from train in a single Polars aggregation
-    break_exprs = [
-        pl.col(col).quantile(q, interpolation="linear").alias(f"q{i}")
-        for i, q in enumerate(quantile_levels)
-    ]
-    raw_breaks = (
-        train_df
-        .select(break_exprs)
-        .row(0, named=True)
-    )
-
-    # Deduplicate and sort — ties can occur with sparse/zero-heavy columns
-    breaks = sorted(set(
-        float(v) for v in raw_breaks.values() if v is not None
-    ))
+    # Use pre-computed breaks when available
+    if breaks_cache and col in breaks_cache:
+        breaks = breaks_cache[col]
+    else:
+        # Original computation as fallback
+        quantile_levels = [i / N_BINS for i in range(1, N_BINS)]
+        break_exprs = [
+            pl.col(col).quantile(q, interpolation="linear").alias(f"q{i}")
+            for i, q in enumerate(quantile_levels)
+        ]
+        raw_breaks = train_df.select(break_exprs).row(0, named=True)
+        breaks = sorted(set(float(v) for v in raw_breaks.values() if v is not None))
 
     if len(breaks) < 2:
         return None  # degenerate column — caller falls back to robust scaling
 
-    # Integer bin labels: "0", "1", … "N_BINS-1"
-    # len(labels) must equal len(breaks) + 1
     labels = [str(i) for i in range(len(breaks) + 1)]
 
-    # In Polars 1.x, cut() is a Series method — NOT a module-level function.
-    # Correct: series.cut(breaks=..., labels=...)
-    # Wrong:   pl.cut(pl.col(...), ...)   ← AttributeError in Polars 1.x
     def _apply_cut(df: pl.DataFrame) -> pl.Series:
         series = df[col].cast(pl.Float64)
         return (
             series
-            .cut(breaks=breaks, labels=labels)  # returns Categorical; nulls for out-of-range
-            .cast(pl.String)                    # Categorical → String ("0".."N"), null → null
-            .fill_null("0")                     # values outside break range → bin 0 (lowest)
-            .cast(pl.Int8)                      # String → Int8 ordinal
+            .cut(breaks=breaks, labels=labels)
+            .cast(pl.String)
+            .fill_null("0")
+            .cast(pl.Int8)
             .alias(col)
         )
-
     return _apply_cut(train_df), _apply_cut(test_df)
 
 
@@ -344,6 +322,64 @@ def mitigate(
         .item()
     )
 
+    # C4: Batch IQR for structural pruning (replaces N×2 per-feature selects)
+    numerical_features = [
+        f for f, (ct, _) in feature_meta.items()
+        if ct in _NUM_TYPES and f in train_df.columns and f in test_df.columns
+    ]
+    _train_iqr_cache: dict[str, float] = {}
+    _test_iqr_cache:  dict[str, float] = {}
+
+    if numerical_features:
+        CHUNK = 50
+        tr_iqr_row = {}
+        te_iqr_row = {}
+        for i in range(0, len(numerical_features), CHUNK):
+            chunk = numerical_features[i:i + CHUNK]
+            tr_iqr_exprs, te_iqr_exprs = [], []
+            for f in chunk:
+                tr_iqr_exprs += [
+                    pl.col(f).quantile(0.75, interpolation="linear").alias(f"{f}__p75"),
+                    pl.col(f).quantile(0.25, interpolation="linear").alias(f"{f}__p25"),
+                ]
+                te_iqr_exprs += [
+                    pl.col(f).quantile(0.75, interpolation="linear").alias(f"{f}__p75"),
+                    pl.col(f).quantile(0.25, interpolation="linear").alias(f"{f}__p25"),
+                ]
+            tr_iqr_row.update(train_df.select(tr_iqr_exprs).row(0, named=True))
+            te_iqr_row.update(test_df.select(te_iqr_exprs).row(0, named=True))
+        for f in numerical_features:
+            _train_iqr_cache[f] = float(
+                (tr_iqr_row[f"{f}__p75"] or 0.0) - (tr_iqr_row[f"{f}__p25"] or 0.0)
+            )
+            _test_iqr_cache[f] = float(
+                (te_iqr_row[f"{f}__p75"] or 0.0) - (te_iqr_row[f"{f}__p25"] or 0.0)
+            )
+
+    # C4: Batch quantile breakpoints for ALL numerical features that will be binned
+    _bin_breaks_cache: dict[str, list[float]] = {}
+    quantile_levels = [i / N_BINS for i in range(1, N_BINS)]
+    bin_candidates = [
+        f for f, (ct, _) in feature_meta.items()
+        if ct in _NUM_TYPES and f in train_df.columns
+    ]
+    if bin_candidates:
+        CHUNK = 50
+        breaks_row = {}
+        for i in range(0, len(bin_candidates), CHUNK):
+            chunk = bin_candidates[i:i + CHUNK]
+            chunk_exprs = [
+                pl.col(f).quantile(q, interpolation="linear").alias(f"{f}__q{j}")
+                for f in chunk
+                for j, q in enumerate(quantile_levels)
+            ]
+            breaks_row.update(train_df.select(chunk_exprs).row(0, named=True))
+        for f in bin_candidates:
+            raw = [breaks_row.get(f"{f}__q{i}") for i in range(len(quantile_levels))]
+            breaks = sorted(set(float(v) for v in raw if v is not None))
+            if len(breaks) >= 2:
+                _bin_breaks_cache[f] = breaks
+
     train_cols: dict[str, pl.Series] = {c: train_df[c] for c in train_df.columns}
     test_cols:  dict[str, pl.Series] = {c: test_df[c]  for c in test_df.columns}
 
@@ -397,26 +433,10 @@ def mitigate(
                     continue
 
         # Condition 2: Near-constant test collapse (numerical features)
+        # C4: Use cached IQR values instead of per-feature selects
         elif col_type in _NUM_TYPES:
-            te_stats = (
-                test_df
-                .select([
-                    pl.col(feature).quantile(0.75, interpolation="linear").alias("p75"),
-                    pl.col(feature).quantile(0.25, interpolation="linear").alias("p25"),
-                ])
-                .row(0, named=True)
-            )
-            test_iqr  = float((te_stats["p75"] or 0.0) - (te_stats["p25"] or 0.0))
-            # Train IQR recomputed here (manifest not available in mitigator)
-            tr_stats = (
-                train_df
-                .select([
-                    pl.col(feature).quantile(0.75, interpolation="linear").alias("p75"),
-                    pl.col(feature).quantile(0.25, interpolation="linear").alias("p25"),
-                ])
-                .row(0, named=True)
-            )
-            train_iqr = float((tr_stats["p75"] or 0.0) - (tr_stats["p25"] or 0.0))
+            train_iqr = _train_iqr_cache.get(feature, 0.0)
+            test_iqr  = _test_iqr_cache.get(feature, 0.0)
             if train_iqr > 1.0 and test_iqr < PRUNE_COLLAPSED_IQR_RATIO * train_iqr:
                 print(f"  ✂ PRUNED: {feature} — test IQR collapsed to near-zero "
                       f"(test_iqr={test_iqr:.4f}, train_iqr={train_iqr:.4f})")
@@ -443,11 +463,8 @@ def mitigate(
                   f"(global_rate={global_rate:.4f}, m={_LAPLACE_M})")
 
         elif col_type in _NUM_TYPES:
-            # ── Quantile Binning — ALL numerical drift severities ──────────
-            # Robust scaling is a monotonic transform: it provably cannot
-            # change any split LightGBM makes.  Quantile binning is non-
-            # monotonic and yields a measurable AU-PRC improvement.
-            result = _quantile_bin_column(feature, train_df, test_df)
+            # C4: Use cached quantile breaks
+            result = _quantile_bin_column(feature, train_df, test_df, breaks_cache=_bin_breaks_cache)
             if result is None:
                 # Degenerate breaks (e.g. zero-IQR column) — leave unchanged
                 print(f"  ⚠ quantile-bin degenerate breaks for '{feature}' — skipped")
