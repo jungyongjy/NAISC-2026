@@ -185,16 +185,16 @@ FD_PLOT_HEIGHT = 500
 
 # Mitigation display labels (maps pipeline strategy strings → human labels)
 MIT_LABELS = {
-    "quantile_binning":              "Quantile Binning",
-    "robust_scaling":                "Robust Scaling",
-    "log_transform + robust_scaling":"Log + Robust Scaling",
-    "frequency_encoding":            "Frequency Encoding",
-    "target encoding (laplace, m=20)": "Target Encoding",
-    "binarise (sparse→binary)":      "Binarisation",
-    "drop_feature":                  "Drop Feature",
-    "none":                          "—",
-    "no_action (stable)":            "—",
-    "no_action (excluded type)":     "—",
+    "quantile_binning":               "Quantile Binning",
+    "robust_scaling":                 "Robust Scaling",
+    "log_transform + robust_scaling": "Log + Robust Scaling",
+    "frequency_encoding":             "Frequency Encoding",
+    "target_encoding":                "Target Encoding (Laplace, m=10)",
+    "binarise (sparse->binary)":      "Binarisation",
+    "drop_feature":                   "Drop Feature",
+    "none":                           "—",
+    "no_action (stable)":             "—",
+    "no_action (excluded type)":      "—",
 }
 
 def _mit_display(raw: str) -> str:
@@ -1098,9 +1098,7 @@ elif page == "Drift Mitigation":
             _MIT_GROUPS["quantile"].append(entry)
         elif "robust" in mit or "scaling" in mit or "log" in mit:
             _MIT_GROUPS["robust"].append(entry)
-        elif "target" in mit or (
-            "frequency" in mit and ftype in ("categorical", "low_card_cat")
-        ):
+        elif "target" in mit:
             _MIT_GROUPS["target"].append(entry)
         elif "frequency" in mit:
             _MIT_GROUPS["frequency"].append(entry)
@@ -1327,9 +1325,9 @@ elif page == "Drift Mitigation":
             # ── Target Encoding ───────────────────────────────────────────
             elif group_key == "target":
                 st.markdown(
-                    "**Laplace-smoothed target encoding (m=20)** — each category "
+                    "**Laplace-smoothed target encoding (m=10)** — each category "
                     "is replaced by its smoothed churn rate from training data. "
-                    "Formula: `(n × rate + 20 × global_rate) / (n + 20)`"
+                    "Formula: `(n × rate + 10 × global_rate) / (n + 10)`"
                 )
                 target_col = "ChurnStatus"
                 if target_col not in train.columns:

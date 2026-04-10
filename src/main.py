@@ -473,9 +473,12 @@ def stage2_classify_and_detect(
             return f"{sev} drift detected"
 
         def _mit(r):
-            mv = r.mitigation.value if hasattr(r.mitigation, "value") else str(r.mitigation)
-            if mv == "frequency_encoding":
+            ft = str(r.feature_type).lower()
+            if ft in ("categorical", "low_card_cat"):
                 return "Target Encoding (Laplace, m=10)"
+            if ft in ("high_cardinality", "high_card_cat"):
+                return "Frequency Encoding"
+            mv = r.mitigation.value if hasattr(r.mitigation, "value") else str(r.mitigation)
             return _MIT_LABEL.get(mv, mv.replace("_", " ").title())
 
         def _segment(r):
@@ -885,26 +888,36 @@ def export_dashboard_feeds(
     root = Path(__file__).resolve().parent.parent
 
     # ── 1. drift_results.csv ─────────────────────────────────────────────────
-    _MIT_LABEL = {
-        "robust_scaling":                 "robust_scaling",
-        "quantile_binning":               "quantile_binning",
-        "log_transform + robust_scaling": "log_transform + robust_scaling",
-        "frequency_encoding":             "frequency_encoding",
-        "drop_feature":                   "drop_feature",
-        "none":                           "none",
-        "no_action (stable)":             "no_action (stable)",
-        "no_action (excluded type)":      "no_action (excluded type)",
+    # Map feature_type → the mitigation mitigator.py ACTUALLY applies.
+    # The detector's MitigationStrategy enum is out of sync with mitigator's
+    # col_type routing: detector says FREQUENCY_ENCODE for categorical (low-card)
+    # but mitigator applies target encoding; detector says DROP for high-cardinality
+    # but mitigator intercepts and applies frequency encoding.
+    _FTYPE_TO_ACTUAL_MIT = {
+        "categorical":      "target_encoding",
+        "low_card_cat":     "target_encoding",
+        "high_cardinality": "frequency_encoding",
+        "high_card_cat":    "frequency_encoding",
+        "numerical":        "quantile_binning",
+        "continuous":       "quantile_binning",
+        "sparse":           "binarise (sparse->binary)",
+    }
+    _MIT_PASSTHROUGH = {
+        "robust_scaling", "quantile_binning", "log_transform + robust_scaling",
+        "none", "no_action (stable)", "no_action (excluded type)", "drop_feature",
     }
     drift_rows = []
     for r in drift_summary.drifted:
+        ft = str(r.feature_type).lower()
         mit_val = r.mitigation.value if hasattr(r.mitigation, "value") else str(r.mitigation)
+        actual_mit = _FTYPE_TO_ACTUAL_MIT.get(ft, mit_val)
         drift_rows.append({
             "feature":        r.column,
             "feature_type":   r.feature_type,
             "drift_severity": r.drift_severity.value,
             "test_used":      r.test_method.value,
             "test_statistic": float(r.test_statistic) if r.test_statistic is not None else None,
-            "mitigation":     _MIT_LABEL.get(mit_val, mit_val),
+            "mitigation":     actual_mit,
             "phase_c_segment_stable":  r.phase_c_segment_stable,
             "phase_c_drifted_months":  r.phase_c_drifted_months,
         })
