@@ -1358,13 +1358,13 @@ elif page == "Drift Mitigation":
                     x_col = feat if is_num_feat else "feat_norm"
 
                     st.markdown(f"#### {feat} {_sev_pill(entry['severity'])}", unsafe_allow_html=True)
-                    st.markdown(f"Global churn rate: `{global_rate:.3f}`")
+                    st.markdown(f"Global churn rate: `{global_rate:.3f}` · Smoothing factor m=10")
 
                     fig3 = make_subplots(
                         rows=1, cols=2,
                         subplot_titles=[
                             "Before: Raw Category Distribution",
-                            "After: Churn Rate per Category",
+                            "After: Laplace-Smoothed Encoding (train-fitted)",
                         ],
                         vertical_spacing=0.14,
                     )
@@ -1391,40 +1391,66 @@ elif page == "Drift Mitigation":
                         name="Test", marker_color="#e63946", opacity=0.8,
                     ), row=1, col=1)
 
-                    if is_num_feat:
-                        train_rate = (train.groupby(feat)[target_col]
-                                      .apply(lambda x: (x == "Yes").mean())
-                                      .to_dict())
-                        test_rate = (test.groupby(feat)[target_col]
-                                     .apply(lambda x: (x == "Yes").mean())
-                                     .to_dict() if target_col in test.columns and feat in test.columns else {})
-                        cats_after = sorted(set(train_rate.keys()) | set(test_rate.keys()))
-                    else:
-                        train_rate = (train.assign(_cat=train[feat].str.lower().str.strip())
-                                      .groupby("_cat")[target_col]
-                                      .apply(lambda x: (x == "Yes").mean())
-                                      .to_dict())
-                        test_rate = (test.assign(_cat=test[feat].str.lower().str.strip())
-                                     .groupby("_cat")[target_col]
-                                     .apply(lambda x: (x == "Yes").mean())
-                                     .to_dict() if target_col in test.columns and feat in test.columns else {})
-                        cats_after = sorted(set(train_rate.keys()) | set(test_rate.keys()), key=lambda c: -tr_vc.get(c, 0))[:20]
+                    # ── After: compute Laplace-smoothed encoded values (m=10) ──
+                    # This is what the model actually receives — NOT raw churn rates.
+                    # Formula: (n_cat * raw_rate + m * global_rate) / (n_cat + m)
+                    # Applied using TRAIN statistics only (as in mitigator.py).
+                    _m = 10  # smoothing factor — must match mitigator.py
 
+                    if is_num_feat:
+                        _grp_train = (train.groupby(feat)[target_col]
+                                      .agg(n="count", raw_rate=lambda x: (x == "Yes").mean())
+                                      .reset_index())
+                        _grp_train["encoded"] = (
+                            (_grp_train["n"] * _grp_train["raw_rate"] + _m * global_rate)
+                            / (_grp_train["n"] + _m)
+                        )
+                        train_encoded = dict(zip(_grp_train[feat], _grp_train["encoded"]))
+                        # For test: map test categories to train-fitted encoding
+                        # (unseen categories fall back to global_rate)
+                        test_encoded = {
+                            c: train_encoded.get(c, global_rate)
+                            for c in (test[feat].dropna().unique() if feat in test.columns else [])
+                        }
+                        cats_after = sorted(set(train_encoded.keys()) | set(test_encoded.keys()))
+                    else:
+                        _grp_train = (train.assign(_cat=train[feat].str.lower().str.strip())
+                                      .groupby("_cat")[target_col]
+                                      .agg(n="count", raw_rate=lambda x: (x == "Yes").mean())
+                                      .reset_index())
+                        _grp_train["encoded"] = (
+                            (_grp_train["n"] * _grp_train["raw_rate"] + _m * global_rate)
+                            / (_grp_train["n"] + _m)
+                        )
+                        train_encoded = dict(zip(_grp_train["_cat"], _grp_train["encoded"]))
+                        # Test categories mapped to train encoding (unseen → global_rate)
+                        _test_cats = (
+                            test[feat].str.lower().str.strip().dropna().unique()
+                            if feat in test.columns else []
+                        )
+                        test_encoded = {c: train_encoded.get(c, global_rate) for c in _test_cats}
+                        cats_after = sorted(
+                            set(train_encoded.keys()) | set(test_encoded.keys()),
+                            key=lambda c: -tr_vc.get(c, 0),
+                        )[:20]
+
+                    # Encoded values: train and test should now be close for shared
+                    # categories (test uses train-fitted encoding), showing alignment.
                     fig3.add_trace(go.Bar(
                         x=[str(c) for c in cats_after],
-                        y=[train_rate.get(c, 0) for c in cats_after],
-                        name="Train churn rate", marker_color="#3b82f6", opacity=0.8,
+                        y=[train_encoded.get(c, global_rate) for c in cats_after],
+                        name="Train encoded", marker_color="#3b82f6", opacity=0.8,
                         showlegend=True,
                     ), row=1, col=2)
                     fig3.add_trace(go.Bar(
                         x=[str(c) for c in cats_after],
-                        y=[test_rate.get(c, 0) for c in cats_after],
-                        name="Test churn rate", marker_color="#e63946", opacity=0.8,
+                        y=[test_encoded.get(c, global_rate) for c in cats_after],
+                        name="Test encoded (train-fitted)", marker_color="#e63946", opacity=0.8,
                         showlegend=True,
                     ), row=1, col=2)
                     fig3.add_hline(
                         y=global_rate, line_dash="dash", line_color="#555",
-                        annotation_text=f"Global Churn Rate {global_rate:.3f}",
+                        annotation_text=f"Global Rate {global_rate:.3f} (smoothing anchor)",
                         annotation_font_color="#555", row=1, col=2,
                     )
 
@@ -1437,13 +1463,18 @@ elif page == "Drift Mitigation":
                     fig3.update_xaxes(tickangle=-35, gridcolor="#e5e5e5", linecolor="#ccc")
                     fig3.update_yaxes(gridcolor="#e5e5e5", linecolor="#ccc")
                     fig3.update_yaxes(title_text="Proportion", row=1, col=1)
-                    fig3.update_yaxes(title_text="Churn Rate", row=1, col=2)
+                    fig3.update_yaxes(title_text="Encoded Value (smoothed churn rate)", row=1, col=2)
                     st.plotly_chart(fig3, use_container_width=True)
                     _mit_callouts(
-                        "Category proportions shifted between train and test, which can make raw category IDs unreliable as model splits.",
-                        "Churn-rate signals per category stay comparatively stable, so target encoding turns unstable labels into robust numeric signal.",
+                        "Category mix shifted between train and test — raw category IDs are unreliable splits when proportions change.",
+                        "Laplace smoothing (m=10) pulls extreme rates toward the global mean, and test categories are mapped to train-fitted encodings — so the model sees stable numeric signal regardless of category mix shift.",
                     )
-                    st.caption("How to read: if train and test churn-rate bars are similar per category, the predictive signal is stable even when category mix drifts.")
+                    st.caption(
+                        "How to read: train and test encoded bars should be close or identical for shared categories "
+                        "— test uses the same train-fitted encoding. Categories with few observations are pulled toward "
+                        f"the global rate ({global_rate:.3f}), reducing overfitting to small cells. "
+                        "Unseen test categories fall back to the global rate."
+                    )
 
             # ── Frequency Encoding ────────────────────────────────────────
             elif group_key == "frequency":
