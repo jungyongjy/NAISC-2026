@@ -45,11 +45,9 @@ python -m streamlit run ./src/dashboard.py
 .
 ├── src/
 │   ├── main.py
-│   ├── dashboard.py
-│   ├── main_binning.py
-│   ├── main_delta.py
-│   └── main_none.py
-├── notebooks/
+│   └── dashboard.py
+├── drift/
+├── schema/
 ├── prediction.csv
 ├── model.joblib
 ├── report.pdf
