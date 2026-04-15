@@ -45,9 +45,16 @@ python -m streamlit run ./src/dashboard.py
 .
 ├── src/
 │   ├── main.py
-│   └── dashboard.py
-├── drift/
-├── schema/
+│   ├── dashboard.py
+│   ├── drift/
+│   │   ├── __init__.py
+│   │   ├── detector.py
+│   │   ├── mitigator.py
+│   │   ├── ranker.py
+│   │   └── report.py
+│   └── schema/
+│       ├── __init__.py
+│       └── classifier.py
 ├── prediction.csv
 ├── model.joblib
 ├── report.pdf
