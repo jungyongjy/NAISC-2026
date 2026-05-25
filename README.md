@@ -4,7 +4,7 @@
 [![LightGBM](https://img.shields.io/badge/LightGBM-4.6.0-green)](https://lightgbm.readthedocs.io/)
 [![Polars](https://img.shields.io/badge/Polars-1.x-orange)](https://pola.rs/)
 
-**Team Green Beans** Singapore University of Social Sciences | NAISC 2026 SingTel Challenge
+**Team Green Beans:** Singapore University of Social Sciences | NAISC 2026 SingTel Challenge
 
 ---
 
@@ -12,7 +12,7 @@
 
 SingTel loses customers every month. Some leave because of price, some because of service, and some because life happens. But here is the hard part: by the time you know who left, it is already too late. The real challenge is spotting who *will* leave next month, before they actually go.
 
-The NAISC 2026 challenge gave us a dataset of 70,430 customers from January to October 2025, and asked us to predict churn for November and December. Sounds straightforward — train a model, make predictions, done.
+The NAISC 2026 challenge gave us a dataset of 70,430 customers from January to October 2025, and asked us to predict churn for November and December. Sounds straightforward; train a model, make predictions, done.
 
 But there is a catch.
 
@@ -68,7 +68,7 @@ This story shaped two key design decisions in our pipeline: always clean the tex
 
 ### Stage 3 — Rank by Urgency with Recency Weighting
 
-Not all drift is equally urgent. A feature that drifted six months ago matters less than one that drifted last month. Stage 3 applies exponential decay weighting — more recent months get higher weight — and multiplies each drifted feature's score by its severity level (severe = 3x, moderate = 2x, mild = 1x).
+Not all drift is equally urgent. A feature that drifted six months ago matters less than one that drifted last month. Stage 3 applies exponential decay weighting; more recent months get higher weight and multiplies each drifted feature's score by its severity level (severe = 3x, moderate = 2x, mild = 1x).
 
 This produces a ranked list so the most urgent fixes are applied first.
 
@@ -87,7 +87,7 @@ Every fix is calculated from training data only. No test data leaks into the fit
 
 ### Stage 5 — Train and Predict
 
-A LightGBM classifier trains on the mitigated data and outputs churn probability predictions. Hyperparameters are locked per competition rules — no tuning after submission freeze.
+A LightGBM classifier trains on the mitigated data and outputs churn probability predictions. Hyperparameters are locked per competition rules. No tuning after submission freeze.
 
 ---
 
