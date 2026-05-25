@@ -9,6 +9,7 @@ pipeline_meta.json
 
 # Local dev / internal tooling — not for submission
 donotupload/
+.claude/
 
 # Output
 # prediction.csv is required for submission, so it is explicitly allowed above.
