@@ -1,10 +1,10 @@
-# NAISC 2026 — SingTel Customer Churn Prediction
+# NAISC 2026: SingTel Customer Churn Prediction
 
 [![Python](https://img.shields.io/badge/python-3.12-blue)](https://www.python.org/)
 [![LightGBM](https://img.shields.io/badge/LightGBM-4.6.0-green)](https://lightgbm.readthedocs.io/)
 [![Polars](https://img.shields.io/badge/Polars-1.x-orange)](https://pola.rs/)
 
-**Team Green Beans** — Nanyang Polytechnic | NAISC 2026 SingTel Challenge
+**Team Green Beans** Singapore University of Social Sciences | NAISC 2026 SingTel Challenge
 
 ---
 
@@ -221,4 +221,4 @@ This project taught us that drift detection is not just about running statistica
 
 ## Team
 
-**Team Green Beans** — Nanyang Polytechnic, Singapore
+**Team Green Beans** — Singapore University of Social Sciences, Singapore
